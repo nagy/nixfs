@@ -3,35 +3,13 @@ use fuser::{
     Request,
 };
 
-use lazy_static::lazy_static;
 use libc::ENOENT;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
-
-// const HELLO_TXT_CONTENT: &str = "Hello World!\n";
-
-// const HELLO_TXT_ATTR: FileAttr = FileAttr {
-//     ino: 2,
-//     size: 13,
-//     blocks: 1,
-//     atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-//     mtime: UNIX_EPOCH,
-//     ctime: UNIX_EPOCH,
-//     crtime: UNIX_EPOCH,
-//     kind: FileType::RegularFile,
-//     perm: 0o644,
-//     nlink: 1,
-//     uid: 501,
-//     gid: 20,
-//     rdev: 0,
-//     flags: 0,
-//     blksize: 512,
-// };
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -53,28 +31,16 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
     }
 }
 
-lazy_static! {
-    static ref HASH_MAP: Arc<Mutex<HashMap<(u64, String), String>>> = {
-        let map = HashMap::new();
-        // map.insert(
-        //     (3, "python3Hy"),
-        //     "/nix/store/m76fm92nar23bc6fnpwgwkiiikzlkvrj-python3-3.13.5-env",
-        // );
-        Arc::new(Mutex::new(map))
-    };
-    static ref COUNTER: Arc<Mutex<u64>> = {
-        let counter = 3;
-        Arc::new(Mutex::new(counter))
-    };
+#[derive(Default)]
+struct HelloFS {
+    hashmap: HashMap<(u64, String), String>,
+    counter: u64,
 }
-
-struct HelloFS;
 
 impl Filesystem for HelloFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         eprintln!("Just some lookup: {:?}", name);
         if parent == 1 {
-            let mut hm = HASH_MAP.lock().unwrap();
             if name.to_str().unwrap_or("").starts_with("_eval") {
                 let attr = name.to_str().unwrap().strip_prefix("_eval").unwrap();
                 eprintln!("inserting, Just calc: {:?}", attr);
@@ -92,13 +58,13 @@ impl Filesystem for HelloFS {
                     .to_string();
 
                 eprintln!("result: {:?}", stdout);
-                let mut cntr = COUNTER.lock().unwrap();
-                hm.insert((*cntr, attr.to_string()), stdout);
-                *cntr += 1;
-                eprintln!("result2: {:?}", hm);
+                self.hashmap
+                    .insert((self.counter, attr.to_string()), stdout);
+                self.counter += 1;
+                eprintln!("result2: {:?}", self.hashmap);
             }
 
-            for (key, _) in hm.iter() {
+            for (key, _) in self.hashmap.iter() {
                 if &key.1 == name.to_str().unwrap_or("") {
                     reply.entry(&TTL, &make_symlink_attr(key.0), 0);
                     return;
@@ -135,8 +101,7 @@ impl Filesystem for HelloFS {
     }
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
-        let hm = HASH_MAP.lock().unwrap();
-        for (key, path) in hm.iter() {
+        for (key, path) in self.hashmap.iter() {
             if key.0 == inode {
                 reply.data(path.as_bytes());
                 return;
@@ -153,7 +118,6 @@ impl Filesystem for HelloFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let hm = HASH_MAP.lock().unwrap();
         if ino != 1 {
             reply.error(ENOENT);
             return;
@@ -166,7 +130,7 @@ impl Filesystem for HelloFS {
             // (2, FileType::RegularFile, "hello.txt"),
             // (3, FileType::Symlink, "python3Hy"),
         ];
-        for (key, _) in hm.iter() {
+        for (key, _) in self.hashmap.iter() {
             let val = format!("_eval{}", key.1);
             entries.push((key.0, FileType::Symlink, val.to_string()));
         }
@@ -183,7 +147,7 @@ impl Filesystem for HelloFS {
 
 fn main() {
     fuser::mount2(
-        HelloFS,
+        HelloFS::default(),
         "/tmp/t10/nixfs",
         &vec![
             MountOption::RO,
