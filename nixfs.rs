@@ -1,6 +1,4 @@
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyEntry, Request,
-};
+use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyEntry, Request};
 
 use libc::ENOENT;
 use memoize::memoize;
@@ -9,8 +7,6 @@ use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
-
-const TTL: Duration = Duration::from_secs(30);
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -22,7 +18,7 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
         kind: FileType::Symlink,
-        perm: 0o644,
+        perm: 0o444,
         nlink: 1,
         uid: 1000,
         gid: 100,
@@ -101,7 +97,7 @@ impl Filesystem for HelloFS {
         let output = nix_attr_to_outpath(attr.to_string());
         match output {
             Some(_) => {
-                reply.entry(&TTL, &make_symlink_attr(hashinode), 0);
+                reply.entry(&Duration::MAX, &make_symlink_attr(hashinode), 0);
                 self.hashmap.insert(hashinode, attr.to_string());
             }
             None => {
@@ -121,7 +117,7 @@ impl Filesystem for HelloFS {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: 0o555,
             nlink: 2,
             uid: 501,
             gid: 20,
@@ -131,11 +127,11 @@ impl Filesystem for HelloFS {
         };
         /* parent */
         if ino == 1 {
-            reply.attr(&TTL, &HELLO_DIR_ATTR);
+            reply.attr(&Duration::MAX, &HELLO_DIR_ATTR);
             return;
         }
         if let Some(_) = self.hashmap.get(&ino) {
-            reply.attr(&TTL, &make_symlink_attr(ino));
+            reply.attr(&Duration::MAX, &make_symlink_attr(ino));
             return;
         }
         reply.error(ENOENT);
@@ -177,6 +173,7 @@ impl Filesystem for HelloFS {
 }
 
 fn main() {
+    use fuser::MountOption;
     fuser::mount2(
         HelloFS::default(),
         "/tmp/t10/nixfs",
