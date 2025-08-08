@@ -10,7 +10,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(30);
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -38,46 +38,77 @@ struct HelloFS {
 }
 
 #[memoize]
-fn nix_attr_to_outpath(attr: String) -> String {
+fn nix_attr_to_outpath(attr: String) -> Option<String> {
     eprintln!("execute: {:?}", attr);
     let output = Command::new("nix-build")
         .arg("--no-out-link")
         .arg("<nixpkgs>")
         .arg("-A")
         .arg(attr)
-        .output()
-        .unwrap();
-    let stdout: String = String::from_utf8(output.stdout)
-        .unwrap()
-        .strip_suffix("\n")
-        .unwrap()
-        .to_string();
-    stdout
+        .output();
+    if output.is_err() {
+        return None;
+    }
+    match output {
+        Ok(output2) => {
+            if output2.status.success() {
+                let stdout: String = String::from_utf8(output2.stdout)
+                    .unwrap()
+                    .strip_suffix("\n")
+                    .unwrap()
+                    .to_string();
+                Some(stdout)
+            } else {
+                return None;
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 impl Filesystem for HelloFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        // skip some know non-existing values
+        if name.to_str().unwrap_or("").starts_with(".") {
+            reply.error(ENOENT);
+            return;
+        }
+        if name.to_str().unwrap_or("").ends_with(".") {
+            reply.error(ENOENT);
+            return;
+        }
         eprintln!("Lookup: {:?}", name);
-        MEMOIZED_MAPPING_NIX_ATTR_TO_OUTPATH.with_borrow(|v| {
-            eprintln!("storeident:: {:?}", v);
-        });
+        let name = name.to_str().unwrap();
+        // MEMOIZED_MAPPING_NIX_ATTR_TO_OUTPATH.with_borrow(|v| {
+        //     eprintln!("storeident:: {:?}", v);
+        // });
         if parent != 1 {
             reply.error(ENOENT);
             return;
         }
-        if !name.to_str().unwrap_or("").starts_with("_eval") {
-            reply.error(ENOENT);
-            return;
-        }
-        let attr = name.to_str().unwrap().strip_prefix("_eval").unwrap();
+        // if !name.starts_with("_eval") {
+        //     reply.error(ENOENT);
+        //     return;
+        // }
+        // let attr = name.strip_prefix("_eval").unwrap();
+        let attr = name;
         eprintln!("inserting attr: {:?}", attr);
         let hashinode = {
             let mut hasher = DefaultHasher::new();
             attr.hash(&mut hasher);
             hasher.finish()
         };
-        reply.entry(&TTL, &make_symlink_attr(hashinode), 0);
-        self.hashmap.insert(hashinode, attr.to_string());
+        let output = nix_attr_to_outpath(attr.to_string());
+        match output {
+            Some(_) => {
+                reply.entry(&TTL, &make_symlink_attr(hashinode), 0);
+                self.hashmap.insert(hashinode, attr.to_string());
+            }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -112,7 +143,7 @@ impl Filesystem for HelloFS {
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         if let Some(found) = self.hashmap.get(&inode) {
-            let found2 = nix_attr_to_outpath(found.to_string());
+            let found2 = nix_attr_to_outpath(found.to_string()).unwrap();
             reply.data(found2.as_bytes());
             return;
         }
@@ -131,7 +162,7 @@ impl Filesystem for HelloFS {
             reply.error(ENOENT);
             return;
         }
-        let entries = vec![
+        let entries = [
             (1, FileType::Directory, "."),
             (1, FileType::Directory, ".."),
         ];
@@ -149,7 +180,7 @@ fn main() {
     fuser::mount2(
         HelloFS::default(),
         "/tmp/t10/nixfs",
-        &vec![
+        &[
             MountOption::RO,
             MountOption::FSName("hello".to_string()),
             MountOption::AutoUnmount,
