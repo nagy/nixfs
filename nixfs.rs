@@ -1,12 +1,13 @@
-use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyEntry, Request};
+use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
 
 use libc::ENOENT;
-use memoize::memoize;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
+
+// TODO make whole NIX_PATH accessible
+
+const NIX_BUILD_EXECUTABLE: &'static str = "nix-build";
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -30,16 +31,16 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
 
 #[derive(Default)]
 struct NixFS {
-    hashmap: HashMap<u64, String>,
+    hashmap: std::collections::HashMap<u64, String>,
 }
 
-#[memoize]
+#[memoize::memoize]
 fn nix_attr_to_outpath(attr: String) -> Option<String> {
     eprintln!("execute: {:?}", attr);
-    let output = Command::new("nix-build")
+    let output = std::process::Command::new(NIX_BUILD_EXECUTABLE)
         .arg("--no-out-link")
         .arg("<nixpkgs>")
-        .arg("-A")
+        .arg("--attr")
         .arg(attr)
         .output();
     if output.is_err() {
@@ -62,7 +63,7 @@ fn nix_attr_to_outpath(attr: String) -> Option<String> {
     }
 }
 
-impl Filesystem for NixFS {
+impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // skip some know non-existing values
         if name.to_str().unwrap_or("").starts_with(".") {
@@ -171,9 +172,11 @@ impl Filesystem for NixFS {
 
 fn main() {
     use fuser::MountOption;
+    let args: Vec<String> = std::env::args().collect();
+    let mount_path = &args[1];
     fuser::mount2(
         NixFS::default(),
-        "/nixfs",
+        mount_path,
         &[
             MountOption::RO,
             MountOption::FSName("nixfs".to_string()),
