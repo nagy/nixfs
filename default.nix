@@ -6,7 +6,7 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "nixfs";
-  version = "0-unstable-2025-08-07";
+  version = "0-unstable-2025-08-09";
 
   src = lib.cleanSource ./.;
 
@@ -22,10 +22,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
   ];
 
   meta = {
-    description = "Implementation of plus codes, to be used as CLI tool or crate";
-    homepage = "https://github.com/janne/pluscodes-rs";
-    license = lib.licenses.mit;
+    license = lib.licenses.agpl3Plus;
     maintainers = with lib.maintainers; [ nagy ];
-    mainProgram = "pluscodes";
+    mainProgram = "nixfs";
   };
 })

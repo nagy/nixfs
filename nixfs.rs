@@ -20,8 +20,8 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
         kind: FileType::Symlink,
         perm: 0o444,
         nlink: 1,
-        uid: 1000,
-        gid: 100,
+        uid: 0,
+        gid: 0,
         rdev: 0,
         flags: 0,
         blksize: 512,
@@ -29,7 +29,7 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
 }
 
 #[derive(Default)]
-struct HelloFS {
+struct NixFS {
     hashmap: HashMap<u64, String>,
 }
 
@@ -62,7 +62,7 @@ fn nix_attr_to_outpath(attr: String) -> Option<String> {
     }
 }
 
-impl Filesystem for HelloFS {
+impl Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // skip some know non-existing values
         if name.to_str().unwrap_or("").starts_with(".") {
@@ -82,11 +82,6 @@ impl Filesystem for HelloFS {
             reply.error(ENOENT);
             return;
         }
-        // if !name.starts_with("_eval") {
-        //     reply.error(ENOENT);
-        //     return;
-        // }
-        // let attr = name.strip_prefix("_eval").unwrap();
         let attr = name;
         eprintln!("inserting attr: {:?}", attr);
         let hashinode = {
@@ -108,26 +103,28 @@ impl Filesystem for HelloFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        const HELLO_DIR_ATTR: FileAttr = FileAttr {
-            ino: 1,
-            size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::Directory,
-            perm: 0o555,
-            nlink: 2,
-            uid: 501,
-            gid: 20,
-            rdev: 0,
-            flags: 0,
-            blksize: 512,
-        };
         /* parent */
         if ino == 1 {
-            reply.attr(&Duration::MAX, &HELLO_DIR_ATTR);
+            reply.attr(
+                &Duration::MAX,
+                &FileAttr {
+                    ino: 1,
+                    size: 0,
+                    blocks: 0,
+                    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    crtime: UNIX_EPOCH,
+                    kind: FileType::Directory,
+                    perm: 0o555,
+                    nlink: 2,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,
+                },
+            );
             return;
         }
         if let Some(_) = self.hashmap.get(&ino) {
@@ -175,11 +172,11 @@ impl Filesystem for HelloFS {
 fn main() {
     use fuser::MountOption;
     fuser::mount2(
-        HelloFS::default(),
-        "/tmp/t10/nixfs",
+        NixFS::default(),
+        "/nixfs",
         &[
             MountOption::RO,
-            MountOption::FSName("hello".to_string()),
+            MountOption::FSName("nixfs".to_string()),
             MountOption::AutoUnmount,
             MountOption::AllowRoot,
         ],
