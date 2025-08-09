@@ -5,9 +5,9 @@ use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, UNIX_EPOCH};
 
-// TODO make whole NIX_PATH accessible
-
 const NIX_BUILD_EXECUTABLE: &'static str = "nix-build";
+const NIXPKGS_NAME: &'static str = "<nixpkgs>";
+const NIXPATH_SPLIT_CHAR: &'static str = "_";
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -31,15 +31,15 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
 
 #[derive(Default)]
 struct NixFS {
-    hashmap: std::collections::HashMap<u64, String>,
+    hashmap: std::collections::HashMap<u64, (String, String)>,
 }
 
 #[memoize::memoize]
-fn nix_attr_to_outpath(attr: String) -> Option<String> {
-    eprintln!("execute: {:?}", attr);
+fn nix_attr_to_outpath(attr: String, file: String) -> Option<String> {
+    eprintln!("Executing: {:?}", attr);
     let output = std::process::Command::new(NIX_BUILD_EXECUTABLE)
         .arg("--no-out-link")
-        .arg("<nixpkgs>")
+        .arg(file)
         .arg("--attr")
         .arg(attr)
         .output();
@@ -63,6 +63,19 @@ fn nix_attr_to_outpath(attr: String) -> Option<String> {
     }
 }
 
+fn split_nixpath_from_attr(filepath: String) -> (String, String) {
+    match filepath.strip_prefix(NIXPATH_SPLIT_CHAR) {
+        None => {
+            // default case
+            return (NIXPKGS_NAME.to_string(), filepath);
+        }
+        Some(rest) => {
+            let (nixpath, rest) = rest.split_once(NIXPATH_SPLIT_CHAR).unwrap();
+            return (format!("<{}>", nixpath), rest.to_string());
+        }
+    }
+}
+
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // skip some know non-existing values
@@ -74,8 +87,9 @@ impl fuser::Filesystem for NixFS {
             reply.error(ENOENT);
             return;
         }
-        eprintln!("Lookup: {:?}", name);
         let name = name.to_str().unwrap();
+        eprintln!("Lookup: {:?}", name);
+        let (nixpath, attr) = split_nixpath_from_attr(name.to_string());
         // MEMOIZED_MAPPING_NIX_ATTR_TO_OUTPATH.with_borrow(|v| {
         //     eprintln!("storeident:: {:?}", v);
         // });
@@ -83,18 +97,18 @@ impl fuser::Filesystem for NixFS {
             reply.error(ENOENT);
             return;
         }
-        let attr = name;
-        eprintln!("inserting attr: {:?}", attr);
+        eprintln!("Inserting attr: {:?}, {nixpath}", attr);
         let hashinode = {
             let mut hasher = DefaultHasher::new();
+            nixpath.hash(&mut hasher);
             attr.hash(&mut hasher);
             hasher.finish()
         };
-        let output = nix_attr_to_outpath(attr.to_string());
+        let output = nix_attr_to_outpath(attr.clone(), nixpath.clone());
         match output {
             Some(_) => {
                 reply.entry(&Duration::MAX, &make_symlink_attr(hashinode), 0);
-                self.hashmap.insert(hashinode, attr.to_string());
+                self.hashmap.insert(hashinode, (nixpath, attr));
             }
             None => {
                 reply.error(ENOENT);
@@ -136,8 +150,8 @@ impl fuser::Filesystem for NixFS {
     }
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
-        if let Some(found) = self.hashmap.get(&inode) {
-            let found2 = nix_attr_to_outpath(found.to_string()).unwrap();
+        if let Some((found_nixpath, found)) = self.hashmap.get(&inode) {
+            let found2 = nix_attr_to_outpath(found.clone(), found_nixpath.clone()).unwrap();
             reply.data(found2.as_bytes());
             return;
         }
@@ -173,7 +187,8 @@ impl fuser::Filesystem for NixFS {
 fn main() {
     use fuser::MountOption;
     let args: Vec<String> = std::env::args().collect();
-    let mount_path = &args[1];
+    let default_mount_path = &"/nixfs".to_string();
+    let mount_path = &args.get(1).unwrap_or(default_mount_path);
     fuser::mount2(
         NixFS::default(),
         mount_path,
