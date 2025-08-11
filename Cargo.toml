@@ -1,5 +1,5 @@
 [package]
-name = "nixfs-rs"
+name = "nixfs"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,7 +7,6 @@ edition = "2024"
 fuser = "0.15.1"
 libc = "0.2.174"
 memoize = "0.5.1"
-
 
 [[bin]]
 name = "nixfs"

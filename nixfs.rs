@@ -1,9 +1,9 @@
-use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
-
-use libc::ENOENT;
 use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, UNIX_EPOCH};
+
+use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
+use libc::ENOENT;
 
 const NIX_BUILD_EXECUTABLE: &'static str = "nix-build";
 const NIXPKGS_NAME: &'static str = "<nixpkgs>";
@@ -90,9 +90,6 @@ impl fuser::Filesystem for NixFS {
         let name = name.to_str().unwrap();
         eprintln!("Lookup: {:?}", name);
         let (nixpath, attr) = split_nixpath_from_attr(name.to_string());
-        // MEMOIZED_MAPPING_NIX_ATTR_TO_OUTPATH.with_borrow(|v| {
-        //     eprintln!("storeident:: {:?}", v);
-        // });
         if parent != 1 {
             reply.error(ENOENT);
             return;

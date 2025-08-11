@@ -6,7 +6,7 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "nixfs";
-  version = "0-unstable-2025-08-09";
+  version = "0-unstable-2025-08-11";
 
   src = lib.cleanSource ./.;
 
@@ -17,6 +17,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
   nativeBuildInputs = [
     pkgs.pkg-config
   ];
+
   buildInputs = [
     pkgs.fuse
   ];
