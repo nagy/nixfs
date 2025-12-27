@@ -5,9 +5,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
 use libc::ENOENT;
 
-const NIX_BUILD_EXECUTABLE: &'static str = "nix-build";
-const NIXPKGS_NAME: &'static str = "<nixpkgs>";
-const NIXPATH_SPLIT_CHAR: &'static str = "_";
+const NIX_BUILD_EXECUTABLE: &str = "nix-build";
+const NIXPKGS_NAME: &str = "<nixpkgs>";
+const NIXPATH_SPLIT_CHAR: &str = "_";
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -36,7 +36,7 @@ struct NixFS {
 
 #[memoize::memoize]
 fn nix_attr_to_outpath(attr: String, file: String) -> Option<String> {
-    eprintln!("Executing: {:?}", attr);
+    eprintln!("Executing: {attr:?}");
     let output = std::process::Command::new(NIX_BUILD_EXECUTABLE)
         .arg("--no-out-link")
         .arg(file)
@@ -56,7 +56,7 @@ fn nix_attr_to_outpath(attr: String, file: String) -> Option<String> {
                     .to_string();
                 Some(stdout)
             } else {
-                return None;
+                None
             }
         }
         Err(_) => None,
@@ -67,11 +67,11 @@ fn split_nixpath_from_attr(filepath: String) -> (String, String) {
     match filepath.strip_prefix(NIXPATH_SPLIT_CHAR) {
         None => {
             // default case
-            return (NIXPKGS_NAME.to_string(), filepath);
+            (NIXPKGS_NAME.to_string(), filepath)
         }
         Some(rest) => {
             let (nixpath, rest) = rest.split_once(NIXPATH_SPLIT_CHAR).unwrap();
-            return (format!("<{}>", nixpath), rest.to_string());
+            (format!("<{nixpath}>"), rest.to_string())
         }
     }
 }
@@ -79,22 +79,22 @@ fn split_nixpath_from_attr(filepath: String) -> (String, String) {
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // skip some know non-existing values
-        if name.to_str().unwrap_or("").starts_with(".") {
+        if name.to_str().unwrap_or("").starts_with('.') {
             reply.error(ENOENT);
             return;
         }
-        if name.to_str().unwrap_or("").ends_with(".") {
+        if name.to_str().unwrap_or("").ends_with('.') {
             reply.error(ENOENT);
             return;
         }
         let name = name.to_str().unwrap();
-        eprintln!("Lookup: {:?}", name);
+        eprintln!("Lookup: {name:?}");
         let (nixpath, attr) = split_nixpath_from_attr(name.to_string());
         if parent != 1 {
             reply.error(ENOENT);
             return;
         }
-        eprintln!("Inserting attr: {:?}, {nixpath}", attr);
+        eprintln!("Inserting attr: {attr:?}, {nixpath}");
         let hashinode = {
             let mut hasher = DefaultHasher::new();
             nixpath.hash(&mut hasher);
@@ -109,7 +109,6 @@ impl fuser::Filesystem for NixFS {
             }
             None => {
                 reply.error(ENOENT);
-                return;
             }
         }
     }

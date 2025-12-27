@@ -2,6 +2,8 @@
   pkgs ? import <nixpkgs> { },
   lib ? pkgs.lib,
   rustPlatform ? pkgs.rustPlatform,
+  pkg-config ? pkgs.pkg-config,
+  fuse3 ? pkgs.fuse3,
 }:
 
 rustPlatform.buildRustPackage (finalAttrs: {
@@ -15,11 +17,11 @@ rustPlatform.buildRustPackage (finalAttrs: {
   };
 
   nativeBuildInputs = [
-    pkgs.pkg-config
+    pkg-config
   ];
 
   buildInputs = [
-    pkgs.fuse
+    fuse3
   ];
 
   meta = {
