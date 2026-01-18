@@ -138,7 +138,7 @@ impl fuser::Filesystem for NixFS {
             );
             return;
         }
-        if let Some(_) = self.hashmap.get(&ino) {
+        if self.hashmap.contains_key(&ino) {
             reply.attr(&Duration::MAX, &make_symlink_attr(ino));
             return;
         }
