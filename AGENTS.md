@@ -60,12 +60,13 @@ See `RECOMMENDATIONS.md` for full details. Implemented items:
 
 | # | Recommendation | Status |
 |---|---|---|
+| 8 | Eliminate bare unwrap() calls | ✅ Done |
 | 6 | Distinguish error types | ✅ Done |
 | 4 | Remove underscore multi-nixpath feature | ✅ Done |
 | 7 | Separate existence checks from builds | ✅ Done |
 | 2 | Store resolved paths in cache | ✅ Done (as part of #7) |
 
-Not yet implemented: #1, #3, #5, #8, #9, #10.
+Not yet implemented: #1, #3, #5, #9, #10.
 
 ## Build & test
 

@@ -112,16 +112,20 @@ fn classify_eval_error(stderr: &str) -> i32 {
 
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        // Reject non-UTF-8 names — Nix attr names are always valid UTF-8.
+        let Some(attr) = name.to_str() else {
+            reply.error(EINVAL);
+            return;
+        };
         // Reject names that look like dotfiles — invalid as Nix attr names.
-        if name.to_str().unwrap_or("").starts_with('.') {
+        if attr.starts_with('.') {
             reply.error(EINVAL);
             return;
         }
-        if name.to_str().unwrap_or("").ends_with('.') {
+        if attr.ends_with('.') {
             reply.error(EINVAL);
             return;
         }
-        let attr = name.to_str().unwrap();
         eprintln!("Lookup: {attr:?}");
         if parent != 1 {
             reply.error(ENOENT);
@@ -228,7 +232,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let default_mount_path = &"/nixfs".to_string();
     let mount_path = &args.get(1).unwrap_or(default_mount_path);
-    fuser::mount2(
+    if let Err(e) = fuser::mount2(
         NixFS::default(),
         mount_path,
         &[
@@ -237,6 +241,8 @@ fn main() {
             MountOption::AutoUnmount,
             MountOption::AllowRoot,
         ],
-    )
-    .unwrap();
+    ) {
+        eprintln!("Failed to mount {}: {e}", mount_path);
+        std::process::exit(1);
+    }
 }
