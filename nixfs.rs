@@ -1,12 +1,14 @@
 use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
 use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENOENT, ENOTDIR, ETIMEDOUT};
 
 const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
+/// How long cached directory listings and resolved store paths remain valid.
+const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -67,6 +69,21 @@ enum EntryKind {
 
 struct Entry {
     kind: EntryKind,
+    /// When this entry was created or last had its cached data refreshed.
+    created: Instant,
+}
+
+impl Entry {
+    fn new(kind: EntryKind) -> Self {
+        Entry {
+            kind,
+            created: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.created.elapsed() > CACHE_TTL
+    }
 }
 
 #[derive(Default)]
@@ -110,8 +127,7 @@ fn nix_eval_attr(attr_path: &str) -> EvalResult {
     match output {
         Ok(output) => {
             if output.status.success() {
-                let stdout = String::from_utf8(output.stdout)
-                    .map_err(|_| EIO);
+                let stdout = String::from_utf8(output.stdout).map_err(|_| EIO);
                 match stdout {
                     Ok(s) => EvalResult::Symlink(s.trim_end_matches('\n').to_string()),
                     Err(e) => EvalResult::Err(e),
@@ -287,24 +303,20 @@ impl fuser::Filesystem for NixFS {
                 reply.entry(&Duration::MAX, &make_symlink_attr(inode), 0);
                 self.entries.insert(
                     inode,
-                    Entry {
-                        kind: EntryKind::Symlink {
-                            attr_path: child_path,
-                            out_path: Some(out_path),
-                        },
-                    },
+                    Entry::new(EntryKind::Symlink {
+                        attr_path: child_path,
+                        out_path: Some(out_path),
+                    }),
                 );
             }
             EvalResult::Directory => {
                 reply.entry(&Duration::MAX, &make_dir_attr(inode), 0);
                 self.entries.insert(
                     inode,
-                    Entry {
-                        kind: EntryKind::Dir {
-                            attr_path: child_path,
-                            children: None,
-                        },
-                    },
+                    Entry::new(EntryKind::Dir {
+                        attr_path: child_path,
+                        children: None,
+                    }),
                 );
             }
             EvalResult::Err(errno) => {
@@ -331,11 +343,17 @@ impl fuser::Filesystem for NixFS {
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         if let Some(entry) = self.entries.get_mut(&inode) {
+            // Capture whether we need a fresh resolve before borrowing kind.
+            let expired = entry.is_expired();
             match &mut entry.kind {
-                EntryKind::Symlink { attr_path, out_path } => {
-                    // Lazy-resolve if this entry was created by readdir (no path yet).
-                    if out_path.is_none() {
+                EntryKind::Symlink {
+                    attr_path,
+                    out_path,
+                } => {
+                    let need_resolve = out_path.is_none() || expired;
+                    if need_resolve {
                         if let EvalResult::Symlink(path) = nix_eval_attr(attr_path) {
+                            entry.created = Instant::now();
                             *out_path = Some(path);
                         }
                     }
@@ -365,31 +383,49 @@ impl fuser::Filesystem for NixFS {
         let (dir_path, children): (String, Vec<(String, u64, FileType)>) = if ino == 1 {
             // Root: attr path is empty.
             let attr_path = String::new();
-            let cached = self.entries.get(&1).and_then(|e| match &e.kind {
-                EntryKind::Dir { children, .. } => children.clone(),
-                _ => None,
-            });
-            let children = match cached {
-                Some(c) => c,
-                None => match nix_list_directory("") {
+            let need_load = match self.entries.get(&1) {
+                Some(e) => match &e.kind {
+                    EntryKind::Dir {
+                        children: Some(_), ..
+                    } => e.is_expired(),
+                    _ => true,
+                },
+                None => true,
+            };
+            let children = if need_load {
+                match nix_list_directory("") {
                     Ok(c) => {
-                        // Update root entry with cached children.
                         self.entries.insert(
                             1,
-                            Entry {
-                                kind: EntryKind::Dir {
-                                    attr_path: attr_path.clone(),
-                                    children: Some(c.clone()),
-                                },
-                            },
+                            Entry::new(EntryKind::Dir {
+                                attr_path: attr_path.clone(),
+                                children: Some(c.clone()),
+                            }),
                         );
                         c
                     }
                     Err(errno) => {
-                        reply.error(errno);
-                        return;
+                        // If load fails but we had stale data, return the stale data.
+                        match self.entries.get(&1).and_then(|e| match &e.kind {
+                            EntryKind::Dir { children, .. } => children.clone(),
+                            _ => None,
+                        }) {
+                            Some(stale) => stale,
+                            None => {
+                                reply.error(errno);
+                                return;
+                            }
+                        }
                     }
-                },
+                }
+            } else {
+                self.entries
+                    .get(&1)
+                    .and_then(|e| match &e.kind {
+                        EntryKind::Dir { children, .. } => children.clone(),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
             };
             (attr_path, children)
         } else {
@@ -400,23 +436,32 @@ impl fuser::Filesystem for NixFS {
                     return;
                 }
             };
+            let expired = entry.is_expired();
             let (attr_path, children) = match &mut entry.kind {
                 EntryKind::Dir {
                     attr_path,
                     children: cached,
                 } => {
-                    let children = match cached {
-                        Some(c) => c.clone(),
-                        None => match nix_list_directory(attr_path) {
+                    let need_load = cached.is_none() || expired;
+                    let children = if need_load {
+                        match nix_list_directory(attr_path) {
                             Ok(c) => {
+                                entry.created = Instant::now();
                                 *cached = Some(c.clone());
                                 c
                             }
                             Err(errno) => {
-                                reply.error(errno);
-                                return;
+                                // If reload fails but we had stale data, return that.
+                                if let Some(stale) = cached.clone() {
+                                    stale
+                                } else {
+                                    reply.error(errno);
+                                    return;
+                                }
                             }
-                        },
+                        }
+                    } else {
+                        cached.clone().unwrap_or_default()
                     };
                     (attr_path.clone(), children)
                 }
@@ -448,7 +493,7 @@ impl fuser::Filesystem for NixFS {
                     },
                     _ => continue,
                 };
-                self.entries.insert(*child_inode, Entry { kind });
+                self.entries.insert(*child_inode, Entry::new(kind));
             }
         }
 
