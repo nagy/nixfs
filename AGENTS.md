@@ -20,30 +20,35 @@ pointing to the Nix store path of `<nixpkgs>.vim`.
 ```
 user command         FUSE op            nixfs action
 ─────────────────────────────────────────────────────────
-ls /nixfs/           readdir            returns "." and ".." (flat fs for now)
-ls /nixfs/vim        lookup("vim")      nix eval --raw -f '<nixpkgs>' 'vim.outPath'
-                                        → cache result in Entry.out_path
-                                        → create inode (hash of attr name)
-ls -l /nixfs/vim     getattr(inode)     return symlink attrs from cache
-                      readlink(inode)    return cached out_path (no subprocess)
+ls /nixfs/           readdir(1)         nix_list_directory("") → caches in root Entry
+                     (per child)        inserts stub Entry (Dir or Symlink) in HashMap
+ls /nixfs/vim        lookup("vim",1)     checks HashMap → found stub → reply entry
+                     getattr(inode)      returns symlink attrs from stub
+                      readlink(inode)    lazy: nix_eval_attr → caches out_path in stub
+ls /nixfs/python3/   readdir(dir_inode) nix_list_directory("python3Packages")
+                                        → caches & inserts stubs
 cat /nixfs/vim/...   (follows link)     Nix daemon builds if needed (outside nixfs)
 ```
 
 ### Key types
 
-- **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of attr name).
-- **`Entry`** — stores `attr` and `out_path: Option<String>` (the resolved store path).
-- **Inode scheme:** `DefaultHasher` over the attr name → deterministic 64-bit inode.
-- **Root inode:** fixed at `1` (a directory).
-- **Nixpkgs** is hardcoded; all lookups use `nix eval -f '<nixpkgs>'`.
+- **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of full dotted attr path).
+- **`Entry`** — `Dir { attr_path, children }` or `Symlink { attr_path, out_path }`.
+  Symlink `out_path` is `None` for stub entries created by `readdir` (resolved lazily in `readlink`).
+- **Inode scheme:** `DefaultHasher` over the full dotted attr path → deterministic 64-bit inode.
+- **Root:** inode 1, stores its own `Dir` entry with cached children after first `readdir`.
+  All lookups target `<nixpkgs>` (hardcoded).
 
-### Nix command used
+### Nix commands used
 
 | Command | Purpose | Triggers build? |
 |---|---|---|
-| `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` | Resolve store path | No (evaluation only) |
+| `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` | Resolve store path (derivations) | No |
+| `nix eval --impure --json --expr 'builtins.mapAttrs ... pkgs.<path>'` | List directory children | No |
 
-`nix-build` is no longer used in the hot path (removed in commit 1e4bc4d).
+Both use `builtins.tryEval` where needed to handle broken packages. `--impure` is
+only used for `--expr` (required for `import <nixpkgs>` in newer Nix); `-f` works
+in pure mode.
 
 ### Path parsing
 
@@ -56,17 +61,12 @@ Filenames are used directly as Nixpkgs attribute names. No path manipulation nee
 
 ## Recommendations status
 
-See `RECOMMENDATIONS.md` for full details. Implemented items:
+See `RECOMMENDATIONS.md` for details on pending items.
 
-| # | Recommendation | Status |
-|---|---|---|
-| 8 | Eliminate bare unwrap() calls | ✅ Done |
-| 6 | Distinguish error types | ✅ Done |
-| 4 | Remove underscore multi-nixpath feature | ✅ Done |
-| 7 | Separate existence checks from builds | ✅ Done |
-| 2 | Store resolved paths in cache | ✅ Done (as part of #7) |
+Already implemented: #1 (directories), #2 (cached paths), #4 (removed `_` prefix),
+#6 (error types), #7 (eval vs build), #8 (no unwrap).
 
-Not yet implemented: #1, #3, #5, #9, #10.
+Pending: #3 (cache TTL), #5 (non-blocking), #9 (modules), #10 (CLI).
 
 ## Build & test
 
