@@ -6,8 +6,7 @@ use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
 use libc::{EIO, ENOENT};
 
 const NIX_EVAL_EXECUTABLE: &str = "nix";
-const NIXPKGS_NAME: &str = "<nixpkgs>";
-const NIXPATH_SPLIT_CHAR: &str = "_";
+const NIXPKGS: &str = "<nixpkgs>";
 
 fn make_symlink_attr(inode: u64) -> FileAttr {
     FileAttr {
@@ -32,8 +31,6 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
 struct Entry {
     // Retained for future cache invalidation / re-evaluation (recommendation #3).
     #[allow(dead_code)]
-    nixpath: String,
-    #[allow(dead_code)]
     attr: String,
     /// The resolved Nix store path (e.g. /nix/store/...-hello-2.12.1).
     /// Resolved eagerly in lookup via `nix eval` — evaluates the derivation
@@ -46,21 +43,21 @@ struct NixFS {
     entries: std::collections::HashMap<u64, Entry>,
 }
 
-/// Runs `nix eval --raw -f '<nixpath>' '<attr>.outPath'` to resolve the store
+/// Runs `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` to resolve the store
 /// path of an attribute. This evaluates the derivation (computes the output
 /// path) but does NOT build anything — the build only happens on-demand when
 /// Nix needs to materialise the store path.
 ///
 /// Returns the resolved store path on success (e.g. "/nix/store/...-hello-2.12.1"),
 /// or None if the attribute doesn't exist or evaluation fails.
-fn nix_eval_outpath(nixpath: &str, attr: &str) -> Option<String> {
+fn nix_eval_outpath(attr: &str) -> Option<String> {
     let attr_expr = format!("{attr}.outPath");
-    eprintln!("Evaluating: {attr_expr:?} from {nixpath:?}");
+    eprintln!("Evaluating: {attr_expr:?} from {NIXPKGS:?}");
     let output = std::process::Command::new(NIX_EVAL_EXECUTABLE)
         .arg("eval")
         .arg("--raw")
         .arg("-f")
-        .arg(nixpath)
+        .arg(NIXPKGS)
         .arg(&attr_expr)
         .output();
     match output {
@@ -79,19 +76,6 @@ fn nix_eval_outpath(nixpath: &str, attr: &str) -> Option<String> {
     }
 }
 
-fn split_nixpath_from_attr(filepath: String) -> (String, String) {
-    match filepath.strip_prefix(NIXPATH_SPLIT_CHAR) {
-        None => {
-            // default case
-            (NIXPKGS_NAME.to_string(), filepath)
-        }
-        Some(rest) => {
-            let (nixpath, rest) = rest.split_once(NIXPATH_SPLIT_CHAR).unwrap();
-            (format!("<{nixpath}>"), rest.to_string())
-        }
-    }
-}
-
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // skip some know non-existing values
@@ -103,30 +87,27 @@ impl fuser::Filesystem for NixFS {
             reply.error(ENOENT);
             return;
         }
-        let name = name.to_str().unwrap();
-        eprintln!("Lookup: {name:?}");
-        let (nixpath, attr) = split_nixpath_from_attr(name.to_string());
+        let attr = name.to_str().unwrap();
+        eprintln!("Lookup: {attr:?}");
         if parent != 1 {
             reply.error(ENOENT);
             return;
         }
-        eprintln!("Inserting attr: {attr:?}, {nixpath}");
+        eprintln!("Inserting attr: {attr:?}");
         let hashinode = {
             let mut hasher = DefaultHasher::new();
-            nixpath.hash(&mut hasher);
             attr.hash(&mut hasher);
             hasher.finish()
         };
         // Resolve store path via `nix eval` — evaluates the derivation
         // (fast, no build needed) so readlink returns instantly.
-        match nix_eval_outpath(&nixpath, &attr) {
+        match nix_eval_outpath(attr) {
             Some(out_path) => {
                 reply.entry(&Duration::MAX, &make_symlink_attr(hashinode), 0);
                 self.entries.insert(
                     hashinode,
                     Entry {
-                        nixpath,
-                        attr,
+                        attr: attr.to_string(),
                         out_path: Some(out_path),
                     },
                 );

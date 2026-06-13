@@ -15,7 +15,7 @@ pointing to the Nix store path of `<nixpkgs>.vim`.
 
 ## Architecture
 
-### Data flow (post-recommendation #7)
+### Data flow (current)
 
 ```
 user command         FUSE op            nixfs action
@@ -23,7 +23,7 @@ user command         FUSE op            nixfs action
 ls /nixfs/           readdir            returns "." and ".." (flat fs for now)
 ls /nixfs/vim        lookup("vim")      nix eval --raw -f '<nixpkgs>' 'vim.outPath'
                                         → cache result in Entry.out_path
-                                        → create inode (hash of nixpath+attr)
+                                        → create inode (hash of attr name)
 ls -l /nixfs/vim     getattr(inode)     return symlink attrs from cache
                       readlink(inode)    return cached out_path (no subprocess)
 cat /nixfs/vim/...   (follows link)     Nix daemon builds if needed (outside nixfs)
@@ -31,28 +31,28 @@ cat /nixfs/vim/...   (follows link)     Nix daemon builds if needed (outside nix
 
 ### Key types
 
-- **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of nixpath+attr).
-- **`Entry`** — stores `nixpath`, `attr`, and `out_path: Option<String>` (the resolved store path).
-- **Inode scheme:** `DefaultHasher` over `(nixpath, attr)` → deterministic 64-bit inode.
+- **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of attr name).
+- **`Entry`** — stores `attr` and `out_path: Option<String>` (the resolved store path).
+- **Inode scheme:** `DefaultHasher` over the attr name → deterministic 64-bit inode.
 - **Root inode:** fixed at `1` (a directory).
+- **Nixpkgs** is hardcoded; all lookups use `nix eval -f '<nixpkgs>'`.
 
 ### Nix command used
 
 | Command | Purpose | Triggers build? |
 |---|---|---|
-| `nix eval --raw -f '<nixpath>' '<attr>.outPath'` | Resolve store path | No (evaluation only) |
+| `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` | Resolve store path | No (evaluation only) |
 
 `nix-build` is no longer used in the hot path (removed in commit 1e4bc4d).
 
-### Path parsing (`_` prefix convention)
+### Path parsing
 
-| Input | nixpath | attr |
-|---|---|---|
-| `hello` | `<nixpkgs>` | `hello` |
-| `_foo_bar` | `<foo>` | `bar` |
+Filenames are used directly as Nixpkgs attribute names. No path manipulation needed.
 
-Collected in `split_nixpath_from_attr`. Known issues: `.unwrap()` panic on malformed input,
-underscores in attr names collide with delimiter (recommendation #4).
+| Input | Resolves to |
+|---|---|
+| `vim` | `nix eval --raw -f '<nixpkgs>' 'vim.outPath'` |
+| `python3Packages.numpy` | `nix eval --raw -f '<nixpkgs>' 'python3Packages.numpy.outPath'` |
 
 ## Recommendations status
 
@@ -60,10 +60,11 @@ See `RECOMMENDATIONS.md` for full details. Implemented items:
 
 | # | Recommendation | Status |
 |---|---|---|
+| 4 | Remove underscore multi-nixpath feature | ✅ Done |
 | 7 | Separate existence checks from builds | ✅ Done |
 | 2 | Store resolved paths in cache | ✅ Done (as part of #7) |
 
-Not yet implemented: #1, #3, #4, #5, #6, #8, #9, #10.
+Not yet implemented: #1, #3, #5, #6, #8, #9, #10.
 
 ## Build & test
 
@@ -87,7 +88,7 @@ fusermount -u /tmp/nixfs               # unmount
 - Single file for now; splitting into modules is recommendation #9.
 - `eprintln!` used for debug logging (visible on stderr of the mount process).
 - No async runtime — FUSE ops are synchronous and single-threaded (see recommendation #5).
-- `#[allow(dead_code)]` on `Entry.nixpath` and `Entry.attr` — retained for cache invalidation (recommendation #3).
+- `#[allow(dead_code)]` on `Entry.attr` — retained for cache invalidation (recommendation #3).
 
 ## Commit conventions
 
