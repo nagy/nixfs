@@ -3,7 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
-use libc::{EIO, ENOENT};
+use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENOENT, ETIMEDOUT};
 
 const NIX_EVAL_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
@@ -48,9 +48,15 @@ struct NixFS {
 /// path) but does NOT build anything — the build only happens on-demand when
 /// Nix needs to materialise the store path.
 ///
-/// Returns the resolved store path on success (e.g. "/nix/store/...-hello-2.12.1"),
-/// or None if the attribute doesn't exist or evaluation fails.
-fn nix_eval_outpath(attr: &str) -> Option<String> {
+/// On success returns `Ok(store_path)` (e.g. "/nix/store/...-hello-2.12.1").
+/// On failure returns `Err(errno)` with a specific errno value so the caller
+/// can map it to the appropriate FUSE error:
+///   - ENOENT      — attribute doesn't exist in nixpkgs
+///   - ETIMEDOUT   — nix eval timed out
+///   - ENETUNREACH — network unreachable (can't fetch nixpkgs)
+///   - EACCES      — permission denied
+///   - EIO         — all other evaluation failures
+fn nix_eval_outpath(attr: &str) -> Result<String, i32> {
     let attr_expr = format!("{attr}.outPath");
     eprintln!("Evaluating: {attr_expr:?} from {NIXPKGS:?}");
     let output = std::process::Command::new(NIX_EVAL_EXECUTABLE)
@@ -64,27 +70,55 @@ fn nix_eval_outpath(attr: &str) -> Option<String> {
         Ok(output) => {
             if output.status.success() {
                 let stdout = String::from_utf8(output.stdout)
-                    .ok()?
+                    .map_err(|_| EIO)?
                     .trim_end_matches('\n')
                     .to_string();
-                Some(stdout)
+                Ok(stdout)
             } else {
-                None
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                Err(classify_eval_error(&stderr))
             }
         }
-        Err(_) => None,
+        Err(e) => {
+            // Couldn't even spawn nix — treat as I/O error
+            eprintln!("Failed to spawn nix: {e}");
+            Err(EIO)
+        }
+    }
+}
+
+/// Maps `nix eval` stderr to a specific errno.
+fn classify_eval_error(stderr: &str) -> i32 {
+    if stderr.contains("does not provide attribute")
+        || stderr.contains("attribute '") && stderr.contains("' missing")
+        || stderr.contains("does not exist")
+    {
+        ENOENT
+    } else if stderr.contains("timed out") || stderr.contains("timeout") {
+        ETIMEDOUT
+    } else if stderr.contains("could not resolve")
+        || stderr.contains("unreachable")
+        || stderr.contains("network")
+        || stderr.contains("connection refused")
+        || stderr.contains("name or service not known")
+    {
+        ENETUNREACH
+    } else if stderr.contains("permission denied") || stderr.contains("access denied") {
+        EACCES
+    } else {
+        EIO
     }
 }
 
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        // skip some know non-existing values
+        // Reject names that look like dotfiles — invalid as Nix attr names.
         if name.to_str().unwrap_or("").starts_with('.') {
-            reply.error(ENOENT);
+            reply.error(EINVAL);
             return;
         }
         if name.to_str().unwrap_or("").ends_with('.') {
-            reply.error(ENOENT);
+            reply.error(EINVAL);
             return;
         }
         let attr = name.to_str().unwrap();
@@ -102,7 +136,7 @@ impl fuser::Filesystem for NixFS {
         // Resolve store path via `nix eval` — evaluates the derivation
         // (fast, no build needed) so readlink returns instantly.
         match nix_eval_outpath(attr) {
-            Some(out_path) => {
+            Ok(out_path) => {
                 reply.entry(&Duration::MAX, &make_symlink_attr(hashinode), 0);
                 self.entries.insert(
                     hashinode,
@@ -112,8 +146,8 @@ impl fuser::Filesystem for NixFS {
                     },
                 );
             }
-            None => {
-                reply.error(ENOENT);
+            Err(errno) => {
+                reply.error(errno);
             }
         }
     }
