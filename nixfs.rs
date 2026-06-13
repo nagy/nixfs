@@ -5,8 +5,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
 use libc::{EIO, ENOENT};
 
-const NIX_BUILD_EXECUTABLE: &str = "nix-build";
-const NIX_ENV_EXECUTABLE: &str = "nix-env";
+const NIX_EVAL_EXECUTABLE: &str = "nix";
 const NIXPKGS_NAME: &str = "<nixpkgs>";
 const NIXPATH_SPLIT_CHAR: &str = "_";
 
@@ -31,9 +30,14 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
 }
 
 struct Entry {
+    // Retained for future cache invalidation / re-evaluation (recommendation #3).
+    #[allow(dead_code)]
     nixpath: String,
+    #[allow(dead_code)]
     attr: String,
-    /// The resolved Nix store path. None until first readlink triggers nix-build.
+    /// The resolved Nix store path (e.g. /nix/store/...-hello-2.12.1).
+    /// Resolved eagerly in lookup via `nix eval` — evaluates the derivation
+    /// but does NOT build it.
     out_path: Option<String>,
 }
 
@@ -42,35 +46,22 @@ struct NixFS {
     entries: std::collections::HashMap<u64, Entry>,
 }
 
-/// Cheap existence check: runs `nix-env -qa --json -f '<nixpath>' -A <attr>`.
-/// Returns true if the attribute exists (exit code 0), false otherwise.
-/// This does NOT evaluate or build the derivation — just checks the name.
-fn nix_attr_exists(nixpath: &str, attr: &str) -> bool {
-    eprintln!("Checking existence: {attr:?} in {nixpath:?}");
-    match std::process::Command::new(NIX_ENV_EXECUTABLE)
-        .arg("-qa")
-        .arg("--json")
+/// Runs `nix eval --raw -f '<nixpath>' '<attr>.outPath'` to resolve the store
+/// path of an attribute. This evaluates the derivation (computes the output
+/// path) but does NOT build anything — the build only happens on-demand when
+/// Nix needs to materialise the store path.
+///
+/// Returns the resolved store path on success (e.g. "/nix/store/...-hello-2.12.1"),
+/// or None if the attribute doesn't exist or evaluation fails.
+fn nix_eval_outpath(nixpath: &str, attr: &str) -> Option<String> {
+    let attr_expr = format!("{attr}.outPath");
+    eprintln!("Evaluating: {attr_expr:?} from {nixpath:?}");
+    let output = std::process::Command::new(NIX_EVAL_EXECUTABLE)
+        .arg("eval")
+        .arg("--raw")
         .arg("-f")
         .arg(nixpath)
-        .arg("-A")
-        .arg(attr)
-        .output()
-    {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    }
-}
-
-/// Runs `nix-build --no-out-link --attr <attr> <nixpath>` to actually resolve
-/// the store path. This triggers builds if the derivation is not already in the
-/// Nix store. Returns the store path on success.
-fn nix_build_outpath(nixpath: &str, attr: &str) -> Option<String> {
-    eprintln!("Building: {attr:?} from {nixpath:?}");
-    let output = std::process::Command::new(NIX_BUILD_EXECUTABLE)
-        .arg("--no-out-link")
-        .arg(nixpath)
-        .arg("--attr")
-        .arg(attr)
+        .arg(&attr_expr)
         .output();
     match output {
         Ok(output) => {
@@ -126,19 +117,23 @@ impl fuser::Filesystem for NixFS {
             attr.hash(&mut hasher);
             hasher.finish()
         };
-        // Cheap existence check — does not build anything.
-        if nix_attr_exists(&nixpath, &attr) {
-            reply.entry(&Duration::MAX, &make_symlink_attr(hashinode), 0);
-            self.entries.insert(
-                hashinode,
-                Entry {
-                    nixpath,
-                    attr,
-                    out_path: None, // resolved lazily in readlink
-                },
-            );
-        } else {
-            reply.error(ENOENT);
+        // Resolve store path via `nix eval` — evaluates the derivation
+        // (fast, no build needed) so readlink returns instantly.
+        match nix_eval_outpath(&nixpath, &attr) {
+            Some(out_path) => {
+                reply.entry(&Duration::MAX, &make_symlink_attr(hashinode), 0);
+                self.entries.insert(
+                    hashinode,
+                    Entry {
+                        nixpath,
+                        attr,
+                        out_path: Some(out_path),
+                    },
+                );
+            }
+            None => {
+                reply.error(ENOENT);
+            }
         }
     }
 
@@ -175,11 +170,9 @@ impl fuser::Filesystem for NixFS {
     }
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
-        if let Some(entry) = self.entries.get_mut(&inode) {
-            // Use cached path if already resolved, otherwise build now.
-            if entry.out_path.is_none() {
-                entry.out_path = nix_build_outpath(&entry.nixpath, &entry.attr);
-            }
+        if let Some(entry) = self.entries.get(&inode) {
+            // Path was already resolved in lookup via `nix eval`.
+            // No build needed — just return the cached store path.
             match &entry.out_path {
                 Some(path) => reply.data(path.as_bytes()),
                 None => reply.error(EIO),
