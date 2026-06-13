@@ -109,11 +109,9 @@ enum EvalResult {
 }
 
 /// Runs `nix eval --raw -f '<nixpkgs>' '<attr_path>.outPath'`.
-///
-/// Three possible outcomes:
-/// - Success → Symlink(store_path) — it's a derivation.
-/// - Fails with "value is a set" → Directory — it's an attr set.
-/// - Any other failure → Err(errno).
+/// Evaluates the derivation (no build) — fast, but the resulting store path
+/// may not exist yet if the derivation hasn't been built or substituted.
+/// Used in `lookup` for existence checking.
 fn nix_eval_attr(attr_path: &str) -> EvalResult {
     let expr = format!("{attr_path}.outPath");
     eprintln!("Evaluating: {expr:?} from {NIXPKGS:?}");
@@ -152,6 +150,36 @@ fn nix_eval_attr(attr_path: &str) -> EvalResult {
         Err(e) => {
             eprintln!("Failed to spawn nix: {e}");
             EvalResult::Err(EIO)
+        }
+    }
+}
+
+/// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
+/// build (or substitute) the derivation. Returns the store path on success,
+/// or an errno on failure. Used in `readlink` so the symlink target exists.
+fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
+    eprintln!("Building: {attr_path:?} from {NIXPKGS:?}");
+    let output = std::process::Command::new("nix-build")
+        .arg("--no-out-link")
+        .arg("--attr")
+        .arg(attr_path)
+        .arg(NIXPKGS)
+        .output();
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .map(|s| s.trim_end_matches('\n').to_string())
+                    .map_err(|_| EIO)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                eprintln!("nix_build_attr failed: {stderr}");
+                Err(classify_eval_error(&stderr))
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to spawn nix-build: {e}");
+            Err(EIO)
         }
     }
 }
@@ -299,13 +327,15 @@ impl fuser::Filesystem for NixFS {
         }
 
         match nix_eval_attr(&child_path) {
-            EvalResult::Symlink(out_path) => {
+            EvalResult::Symlink(_out_path) => {
+                // Create a stub — the actual build happens lazily in readlink
+                // so the symlink target is guaranteed to exist when accessed.
                 reply.entry(&Duration::MAX, &make_symlink_attr(inode), 0);
                 self.entries.insert(
                     inode,
                     Entry::new(EntryKind::Symlink {
                         attr_path: child_path,
-                        out_path: Some(out_path),
+                        out_path: None, // built on first readlink
                     }),
                 );
             }
@@ -352,9 +382,14 @@ impl fuser::Filesystem for NixFS {
                 } => {
                     let need_resolve = out_path.is_none() || expired;
                     if need_resolve {
-                        if let EvalResult::Symlink(path) = nix_eval_attr(attr_path) {
-                            entry.created = Instant::now();
-                            *out_path = Some(path);
+                        match nix_build_attr(attr_path) {
+                            Ok(path) => {
+                                entry.created = Instant::now();
+                                *out_path = Some(path);
+                            }
+                            Err(_) => {
+                                // Keep stale path if build fails.
+                            }
                         }
                     }
                     match out_path {
