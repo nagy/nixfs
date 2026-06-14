@@ -62,8 +62,6 @@ enum EntryKind {
     Dir {
         /// Dotted attr path, e.g. "python3Packages".
         attr_path: String,
-        /// Cached child (name, inode, type) list. None = not yet loaded.
-        children: Option<Vec<(String, u64, FileType)>>,
     },
 }
 
@@ -184,76 +182,6 @@ fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
     }
 }
 
-/// Lists the children of a Nix attr set at `attr_path`.
-/// Returns a vec of (name, inode, FileType) on success, or errno on failure.
-fn nix_list_directory(attr_path: &str) -> Result<Vec<(String, u64, FileType)>, i32> {
-    let set_expr = if attr_path.is_empty() {
-        "pkgs".to_string()
-    } else {
-        format!("pkgs.{attr_path}")
-    };
-    // Build a Nix expression that returns {"name": "drv"|"dir"|"broken", ...}.
-    // Uses tryEval to skip derivations/values that fail evaluation.
-    // Note: trailing spaces before each \ are intentional — they become
-    // token separators after the line continuation removes the newline.
-    let expr = format!(
-        "let pkgs = import <nixpkgs> {{}}; \
-        classify = v: let r = builtins.tryEval v; in if !r.success then \"broken\" \
-        else if builtins.isAttrs r.value && r.value ? type then \"drv\" \
-        else if builtins.isAttrs r.value then \"dir\" \
-        else \"other\"; in builtins.mapAttrs (n: v: classify v) {set_expr}"
-    );
-    eprintln!("Listing directory: {attr_path:?}");
-    eprintln!("  nix expr: {expr}");
-    let output = std::process::Command::new(NIX_EXECUTABLE)
-        .arg("eval")
-        .arg("--impure")
-        .arg("--json")
-        .arg("--expr")
-        .arg(&expr)
-        .output();
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("Failed to spawn nix: {e}");
-            return Err(EIO);
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("nix_list_directory failed: {stderr}");
-        return Err(classify_eval_error(&stderr.to_lowercase()));
-    }
-    let stdout = String::from_utf8(output.stdout).map_err(|e| {
-        eprintln!("nix output not valid UTF-8: {e}");
-        EIO
-    })?;
-    // Parse JSON: {"hello": "drv", "python3Packages": "dir", ...}
-    let map: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&stdout).map_err(|e| {
-            eprintln!("Failed to parse nix JSON output: {e}");
-            eprintln!("  raw output: {stdout}");
-            EIO
-        })?;
-    let mut children = Vec::with_capacity(map.len());
-    for (name, kind_val) in map {
-        let kind_str = kind_val.as_str().unwrap_or("other");
-        let file_type = match kind_str {
-            "drv" => FileType::Symlink,
-            "dir" => FileType::Directory,
-            _ => continue,
-        };
-        let child_path = if attr_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{attr_path}.{name}")
-        };
-        let inode = inode_for_attr_path(&child_path);
-        children.push((name, inode, file_type));
-    }
-    Ok(children)
-}
-
 /// Maps `nix eval` stderr to a specific errno.
 fn classify_eval_error(stderr: &str) -> i32 {
     if stderr.contains("does not provide attribute")
@@ -345,7 +273,6 @@ impl fuser::Filesystem for NixFS {
                     inode,
                     Entry::new(EntryKind::Dir {
                         attr_path: child_path,
-                        children: None,
                     }),
                 );
             }
@@ -414,151 +341,36 @@ impl fuser::Filesystem for NixFS {
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        // Determine the attr path for this directory.
-        let (dir_path, children): (String, Vec<(String, u64, FileType)>) = if ino == 1 {
-            // Root: attr path is empty.
-            let attr_path = String::new();
-            let need_load = match self.entries.get(&1) {
-                Some(e) => match &e.kind {
-                    EntryKind::Dir {
-                        children: Some(_), ..
-                    } => e.is_expired(),
-                    _ => true,
-                },
-                None => true,
-            };
-            let children = if need_load {
-                match nix_list_directory("") {
-                    Ok(c) => {
-                        self.entries.insert(
-                            1,
-                            Entry::new(EntryKind::Dir {
-                                attr_path: attr_path.clone(),
-                                children: Some(c.clone()),
-                            }),
-                        );
-                        c
-                    }
-                    Err(errno) => {
-                        // If load fails but we had stale data, return the stale data.
-                        match self.entries.get(&1).and_then(|e| match &e.kind {
-                            EntryKind::Dir { children, .. } => children.clone(),
-                            _ => None,
-                        }) {
-                            Some(stale) => stale,
-                            None => {
-                                reply.error(errno);
-                                return;
-                            }
-                        }
-                    }
-                }
-            } else {
-                self.entries
-                    .get(&1)
-                    .and_then(|e| match &e.kind {
-                        EntryKind::Dir { children, .. } => children.clone(),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
-            };
-            (attr_path, children)
+        // Directories are always empty — Nix attribute discovery is not
+        // provided via readdir.  Packages are resolved only through explicit
+        // lookup + readlink (e.g.  ls -l /nixfs/vim).
+        let parent_inode = if ino == 1 {
+            1
         } else {
-            let entry = match self.entries.get_mut(&ino) {
-                Some(e) => e,
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
-            let expired = entry.is_expired();
-            let (attr_path, children) = match &mut entry.kind {
-                EntryKind::Dir {
-                    attr_path,
-                    children: cached,
-                } => {
-                    let need_load = cached.is_none() || expired;
-                    let children = if need_load {
-                        match nix_list_directory(attr_path) {
-                            Ok(c) => {
-                                entry.created = Instant::now();
-                                *cached = Some(c.clone());
-                                c
-                            }
-                            Err(errno) => {
-                                // If reload fails but we had stale data, return that.
-                                if let Some(stale) = cached.clone() {
-                                    stale
-                                } else {
-                                    reply.error(errno);
-                                    return;
-                                }
-                            }
-                        }
+            match self.entries.get(&ino) {
+                Some(Entry {
+                    kind: EntryKind::Dir { attr_path },
+                    ..
+                }) => attr_path.rfind('.').map_or(1, |pos| {
+                    let parent_path = &attr_path[..pos];
+                    if parent_path.is_empty() {
+                        1
                     } else {
-                        cached.clone().unwrap_or_default()
-                    };
-                    (attr_path.clone(), children)
-                }
+                        inode_for_attr_path(parent_path)
+                    }
+                }),
                 _ => {
                     reply.error(ENOTDIR);
                     return;
                 }
-            };
-            (attr_path, children)
-        };
-
-        // Insert stub entries for children not already in the map,
-        // so getattr and readlink can find them without a prior lookup.
-        for (name, child_inode, ftype) in &children {
-            if !self.entries.contains_key(child_inode) {
-                let child_path = if dir_path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{dir_path}.{name}")
-                };
-                let kind = match ftype {
-                    FileType::Symlink => EntryKind::Symlink {
-                        attr_path: child_path,
-                        out_path: None, // resolved lazily by readlink
-                    },
-                    FileType::Directory => EntryKind::Dir {
-                        attr_path: child_path,
-                        children: None,
-                    },
-                    _ => continue,
-                };
-                self.entries.insert(*child_inode, Entry::new(kind));
             }
-        }
-
-        // Build the full entry list: "." + ".." + children.
-        let parent_inode = if ino == 1 {
-            1
-        } else {
-            self.entries
-                .get(&ino)
-                .and_then(|e| match &e.kind {
-                    EntryKind::Dir { attr_path, .. } => attr_path.rfind('.').map(|pos| {
-                        let parent_path = &attr_path[..pos];
-                        if parent_path.is_empty() {
-                            1
-                        } else {
-                            inode_for_attr_path(parent_path)
-                        }
-                    }),
-                    _ => None,
-                })
-                .unwrap_or(1)
         };
 
-        let mut all: Vec<(u64, FileType, &str)> = Vec::with_capacity(children.len() + 2);
-        all.push((ino, FileType::Directory, "."));
-        all.push((parent_inode, FileType::Directory, ".."));
-        for (name, child_inode, ftype) in &children {
-            all.push((*child_inode, *ftype, name.as_str()));
-        }
-        for (i, entry) in all.into_iter().enumerate().skip(offset as usize) {
+        let entries = [
+            (ino, FileType::Directory, "."),
+            (parent_inode, FileType::Directory, ".."),
+        ];
+        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
                 break;
             }
