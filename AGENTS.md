@@ -8,10 +8,8 @@ AI agent guidance for the nixfs-rs project. Keep this file updated with each com
 Mount at `/nixfs` (or any path), then access e.g. `/nixfs/vim` to get a symlink
 pointing to the Nix store path of `<nixpkgs>.vim`.
 
-- Language: Rust (edition 2024)
-- Single file: `nixfs.rs` (binary, not a library)
-- Dependencies: `fuser` 0.15.1 (FUSE), `libc` 0.2.174 (errno constants)
 - Nix tooling required at runtime: `nix` (for `nix eval`)
+- See `Cargo.toml` for Rust edition, dependencies, and binary layout.
 
 ## Architecture
 
@@ -70,16 +68,9 @@ Pending: #3 (cache TTL), #5 (non-blocking), #9 (modules), #10 (CLI).
 
 ## Build & test
 
-```bash
-cargo check          # fast compile check
-cargo build          # debug build
-cargo build --release
-```
-
-Runtime (requires root for `/nixfs`, or pass a user-writable mountpoint):
+Build with `cargo build --release`. Runtime (requires root for `/nixfs`, or pass a user-writable mountpoint):
 
 ```bash
-cargo build --release
 ./target/release/nixfs /tmp/nixfs &    # mount
 ls -l /tmp/nixfs/vim                   # test lookup + readlink
 fusermount -u /tmp/nixfs               # unmount
