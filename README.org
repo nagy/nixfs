@@ -1,0 +1,13 @@
+#+title: NixFS
+
+Mount Nix expressions like nixpkgs as a FUSE filesystem.
+
+#+begin_src shell
+$ nixfs /nixfs &
+$ /nixfs/hello/bin/hello
+Hello, world!
+#+end_src
+
+* License
+
+[[./LICENSE][AGPL3+]]

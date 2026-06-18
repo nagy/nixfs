@@ -8,7 +8,7 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "nixfs";
-  version = "0-unstable-2025-08-11";
+  version = "0-unstable-2026-06-19";
 
   src = lib.cleanSource ./.;
 
