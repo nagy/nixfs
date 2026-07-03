@@ -8,7 +8,7 @@ AI agent guidance for the nixfs-rs project. Keep this file updated with each com
 Mount at `/nixfs` (or any path), then access e.g. `/nixfs/vim` to get a symlink
 pointing to the Nix store path of `<nixpkgs>.vim`.
 
-- Nix tooling required at runtime: `nix` (for `nix eval`)
+- Nix tooling required at runtime: `nix`, `nix-build`
 - See `Cargo.toml` for Rust edition, dependencies, and binary layout.
 
 ## Architecture
@@ -18,53 +18,36 @@ pointing to the Nix store path of `<nixpkgs>.vim`.
 ```
 user command         FUSE op            nixfs action
 ─────────────────────────────────────────────────────────
-ls /nixfs/           readdir(1)         nix_list_directory("") → caches in root Entry
-                     (per child)        inserts stub Entry (Dir or Symlink) in HashMap
-ls /nixfs/vim        lookup("vim",1)     checks HashMap → found stub → reply entry
-                     getattr(inode)      returns symlink attrs from stub
-                      readlink(inode)    lazy: nix_eval_attr → caches out_path in stub
-ls /nixfs/python3/   readdir(dir_inode) nix_list_directory("python3Packages")
-                                        → caches & inserts stubs
+ls -l /nixfs/vim     lookup("vim",1)     nix_eval_attr → insert Entry (Dir or Symlink stub)
+                      readlink(inode)    nix_build_attr → cache store path, reply symlink target
 cat /nixfs/vim/...   (follows link)     Nix daemon builds if needed (outside nixfs)
+ls /nixfs/           readdir(1)         returns only "." and ".." (directories are empty)
+ls /nixfs/python3/   readdir(dir_inode) same — explicit lookup required to see children
 ```
 
 ### Key types
 
 - **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of full dotted attr path).
-- **`Entry`** — `Dir { attr_path, children }` or `Symlink { attr_path, out_path }`.
-  Symlink `out_path` is `None` for stub entries created by `readdir` (resolved lazily in `readlink`).
+- **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path }`.
+  Symlink `out_path` is `None` for stub entries created by `lookup` (resolved lazily in `readlink`).
 - **Inode scheme:** `DefaultHasher` over the full dotted attr path → deterministic 64-bit inode.
-- **Root:** inode 1, stores its own `Dir` entry with cached children after first `readdir`.
-  All lookups target `<nixpkgs>` (hardcoded).
+- **Root:** inode 1, always a `Dir`. All lookups target `<nixpkgs>` (hardcoded).
 
 ### Nix commands used
 
 | Command | Purpose | Triggers build? |
 |---|---|---|
-| `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` | Resolve store path (derivations) | No |
-| `nix eval --impure --json --expr 'builtins.mapAttrs ... pkgs.<path>'` | List directory children | No |
+| `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` | Existence check + type detection (lookup) | No |
+| `nix-build --no-out-link --attr <attr> <nixpkgs>` | Build/substitute derivation → store path (readlink) | Yes |
 
-Both use `builtins.tryEval` where needed to handle broken packages. `--impure` is
-only used for `--expr` (required for `import <nixpkgs>` in newer Nix); `-f` works
-in pure mode.
-
-### Path parsing
+### Path resolution
 
 Filenames are used directly as Nixpkgs attribute names. No path manipulation needed.
 
-| Input | Resolves to |
-|---|---|
-| `vim` | `nix eval --raw -f '<nixpkgs>' 'vim.outPath'` |
-| `python3Packages.numpy` | `nix eval --raw -f '<nixpkgs>' 'python3Packages.numpy.outPath'` |
-
-## Recommendations status
-
-See `RECOMMENDATIONS.md` for details on pending items.
-
-Already implemented: #1 (directories), #2 (cached paths), #4 (removed `_` prefix),
-#6 (error types), #7 (eval vs build), #8 (no unwrap).
-
-Pending: #3 (cache TTL), #5 (non-blocking), #9 (modules), #10 (CLI).
+| Input | lookup resolves | readlink resolves |
+|---|---|---|
+| `vim` | `nix eval --raw -f '<nixpkgs>' 'vim.outPath'` | `nix-build --no-out-link --attr vim <nixpkgs>` |
+| `python3Packages.numpy` | `nix eval --raw -f '<nixpkgs>' 'python3Packages.numpy.outPath'` | `nix-build --no-out-link --attr python3Packages.numpy <nixpkgs>` |
 
 ## Build & test
 
@@ -78,14 +61,6 @@ fusermount -u /tmp/nixfs               # unmount
 
 ## Style notes
 
-- Single file for now; splitting into modules is recommendation #9.
+- Single file for now; modules planned.
 - `eprintln!` used for debug logging (visible on stderr of the mount process).
-- No async runtime — FUSE ops are synchronous and single-threaded (see recommendation #5).
-- `#[allow(dead_code)]` on `Entry.attr` — retained for cache invalidation (recommendation #3).
-
-## Commit conventions
-
-Prefix commits with the recommendation number when applicable, e.g.:
-```
-Implement recommendation #4: fix path parsing
-```
+- No async runtime — FUSE ops are synchronous and single-threaded.
