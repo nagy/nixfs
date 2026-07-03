@@ -10,7 +10,12 @@ const NIXPKGS: &str = "<nixpkgs>";
 /// How long cached directory listings and resolved store paths remain valid.
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
-fn make_symlink_attr(inode: u64) -> FileAttr {
+fn make_attr(inode: u64, kind: FileType) -> FileAttr {
+    let (perm, nlink) = match kind {
+        FileType::Symlink => (0o444, 1),
+        FileType::Directory => (0o555, 2),
+        _ => (0o444, 1),
+    };
     FileAttr {
         ino: inode,
         size: 0,
@@ -19,29 +24,9 @@ fn make_symlink_attr(inode: u64) -> FileAttr {
         mtime: UNIX_EPOCH,
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
-        kind: FileType::Symlink,
-        perm: 0o444,
-        nlink: 1,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        flags: 0,
-        blksize: 512,
-    }
-}
-
-fn make_dir_attr(inode: u64) -> FileAttr {
-    FileAttr {
-        ino: inode,
-        size: 0,
-        blocks: 0,
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
-        ctime: UNIX_EPOCH,
-        crtime: UNIX_EPOCH,
-        kind: FileType::Directory,
-        perm: 0o555,
-        nlink: 2,
+        kind,
+        perm,
+        nlink,
         uid: 0,
         gid: 0,
         rdev: 0,
@@ -72,13 +57,6 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(kind: EntryKind) -> Self {
-        Entry {
-            kind,
-            created: Instant::now(),
-        }
-    }
-
     fn is_expired(&self) -> bool {
         self.created.elapsed() > CACHE_TTL
     }
@@ -247,8 +225,8 @@ impl fuser::Filesystem for NixFS {
         // If we already have an entry (created by readdir), just reply with it.
         if let Some(entry) = self.entries.get(&inode) {
             let attr = match &entry.kind {
-                EntryKind::Symlink { .. } => make_symlink_attr(inode),
-                EntryKind::Dir { .. } => make_dir_attr(inode),
+                EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
+                EntryKind::Dir { .. } => make_attr(inode, FileType::Directory),
             };
             reply.entry(&Duration::MAX, &attr, 0);
             return;
@@ -258,22 +236,28 @@ impl fuser::Filesystem for NixFS {
             EvalResult::Symlink(_out_path) => {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
-                reply.entry(&Duration::MAX, &make_symlink_attr(inode), 0);
+                reply.entry(&Duration::MAX, &make_attr(inode, FileType::Symlink), 0);
                 self.entries.insert(
                     inode,
-                    Entry::new(EntryKind::Symlink {
-                        attr_path: child_path,
-                        out_path: None, // built on first readlink
-                    }),
+                    Entry {
+                        kind: EntryKind::Symlink {
+                            attr_path: child_path,
+                            out_path: None, // built on first readlink
+                        },
+                        created: Instant::now(),
+                    },
                 );
             }
             EvalResult::Directory => {
-                reply.entry(&Duration::MAX, &make_dir_attr(inode), 0);
+                reply.entry(&Duration::MAX, &make_attr(inode, FileType::Directory), 0);
                 self.entries.insert(
                     inode,
-                    Entry::new(EntryKind::Dir {
-                        attr_path: child_path,
-                    }),
+                    Entry {
+                        kind: EntryKind::Dir {
+                            attr_path: child_path,
+                        },
+                        created: Instant::now(),
+                    },
                 );
             }
             EvalResult::Err(errno) => {
@@ -284,13 +268,13 @@ impl fuser::Filesystem for NixFS {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == 1 {
-            reply.attr(&Duration::MAX, &make_dir_attr(1));
+            reply.attr(&Duration::MAX, &make_attr(1, FileType::Directory));
             return;
         }
         if let Some(entry) = self.entries.get(&ino) {
             let attr = match &entry.kind {
-                EntryKind::Symlink { .. } => make_symlink_attr(ino),
-                EntryKind::Dir { .. } => make_dir_attr(ino),
+                EntryKind::Symlink { .. } => make_attr(ino, FileType::Symlink),
+                EntryKind::Dir { .. } => make_attr(ino, FileType::Directory),
             };
             reply.attr(&Duration::MAX, &attr);
             return;
