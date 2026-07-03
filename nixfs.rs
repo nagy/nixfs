@@ -335,8 +335,7 @@ impl fuser::Filesystem for NixFS {
                 Some(Entry {
                     kind: EntryKind::Dir { attr_path },
                     ..
-                }) => attr_path.rfind('.').map_or(1, |pos| {
-                    let parent_path = &attr_path[..pos];
+                }) => attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
                     if parent_path.is_empty() {
                         1
                     } else {
