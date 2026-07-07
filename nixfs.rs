@@ -8,11 +8,10 @@ use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENOENT, ENOTDIR, ETIMEDOUT};
 const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
 /// How long cached directory listings and resolved store paths remain valid.
-const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const CACHE_TTL: Duration = Duration::from_mins(5); // 5 minutes
 
 fn make_attr(inode: u64, kind: FileType) -> FileAttr {
     let (perm, nlink) = match kind {
-        FileType::Symlink => (0o444, 1),
         FileType::Directory => (0o555, 2),
         _ => (0o444, 1),
     };
@@ -197,19 +196,15 @@ impl fuser::Filesystem for NixFS {
             child_name.to_string()
         } else {
             // Subdirectory — join parent path + "." + name.
-            let parent_entry = match self.entries.get(&parent) {
-                Some(e) => e,
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
+            let Some(parent_entry) = self.entries.get(&parent) else {
+                reply.error(ENOENT);
+                return;
             };
-            let parent_path = match &parent_entry.kind {
-                EntryKind::Dir { attr_path, .. } => attr_path.as_str(),
-                _ => {
-                    reply.error(ENOTDIR);
-                    return;
-                }
+            let parent_path = if let EntryKind::Dir { attr_path, .. } = &parent_entry.kind {
+                attr_path.as_str()
+            } else {
+                reply.error(ENOTDIR);
+                return;
             };
             format!("{parent_path}.{child_name}")
         };
@@ -284,17 +279,11 @@ impl fuser::Filesystem for NixFS {
                     created,
                 } => {
                     let need_resolve = out_path.is_none() || created.elapsed() > CACHE_TTL;
-                    if need_resolve {
-                        match nix_build_attr(attr_path) {
-                            Ok(path) => {
-                                *created = Instant::now();
-                                *out_path = Some(path);
-                            }
-                            Err(_) => {
-                                // Keep stale path if build fails.
-                            }
-                        }
+                    if need_resolve && let Ok(path) = nix_build_attr(attr_path) {
+                        *created = Instant::now();
+                        *out_path = Some(path);
                     }
+                    // else: keep stale path if build fails.
                     match out_path {
                         Some(path) => reply.data(path.as_bytes()),
                         None => reply.error(EIO),
@@ -357,7 +346,7 @@ impl fuser::Filesystem for NixFS {
 fn main() {
     use fuser::MountOption;
     let args: Vec<String> = std::env::args().collect();
-    let mount_path = args.get(1).map(|s| s.as_str()).unwrap_or("/nixfs");
+    let mount_path = args.get(1).map_or("/nixfs", String::as_str);
     if let Err(e) = fuser::mount2(
         NixFS::default(),
         mount_path,
@@ -368,7 +357,7 @@ fn main() {
             MountOption::AllowRoot,
         ],
     ) {
-        eprintln!("Failed to mount {}: {e}", mount_path);
+        eprintln!("Failed to mount {mount_path}: {e}");
         std::process::exit(1);
     }
 }
