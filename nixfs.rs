@@ -42,6 +42,8 @@ enum EntryKind {
         attr_path: String,
         /// Cached store path. None if created by readdir (resolved lazily).
         out_path: Option<String>,
+        /// When this store path was last resolved.
+        created: Instant,
     },
     /// A Nix attribute set — appears as a directory.
     Dir {
@@ -52,14 +54,6 @@ enum EntryKind {
 
 struct Entry {
     kind: EntryKind,
-    /// When this entry was created or last had its cached data refreshed.
-    created: Instant,
-}
-
-impl Entry {
-    fn is_expired(&self) -> bool {
-        self.created.elapsed() > CACHE_TTL
-    }
 }
 
 #[derive(Default)]
@@ -243,8 +237,8 @@ impl fuser::Filesystem for NixFS {
                         kind: EntryKind::Symlink {
                             attr_path: child_path,
                             out_path: None, // built on first readlink
+                            created: Instant::now(),
                         },
-                        created: Instant::now(),
                     },
                 );
             }
@@ -256,7 +250,6 @@ impl fuser::Filesystem for NixFS {
                         kind: EntryKind::Dir {
                             attr_path: child_path,
                         },
-                        created: Instant::now(),
                     },
                 );
             }
@@ -284,18 +277,17 @@ impl fuser::Filesystem for NixFS {
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         if let Some(entry) = self.entries.get_mut(&inode) {
-            // Capture whether we need a fresh resolve before borrowing kind.
-            let expired = entry.is_expired();
             match &mut entry.kind {
                 EntryKind::Symlink {
                     attr_path,
                     out_path,
+                    created,
                 } => {
-                    let need_resolve = out_path.is_none() || expired;
+                    let need_resolve = out_path.is_none() || created.elapsed() > CACHE_TTL;
                     if need_resolve {
                         match nix_build_attr(attr_path) {
                             Ok(path) => {
-                                entry.created = Instant::now();
+                                *created = Instant::now();
                                 *out_path = Some(path);
                             }
                             Err(_) => {
@@ -365,8 +357,7 @@ impl fuser::Filesystem for NixFS {
 fn main() {
     use fuser::MountOption;
     let args: Vec<String> = std::env::args().collect();
-    let default_mount_path = &"/nixfs".to_string();
-    let mount_path = &args.get(1).unwrap_or(default_mount_path);
+    let mount_path = args.get(1).map(|s| s.as_str()).unwrap_or("/nixfs");
     if let Err(e) = fuser::mount2(
         NixFS::default(),
         mount_path,
