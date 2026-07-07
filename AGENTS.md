@@ -9,6 +9,7 @@ Mount at `/nixfs` (or any path), then access e.g. `/nixfs/vim` to get a symlink
 pointing to the Nix store path of `<nixpkgs>.vim`.
 
 - Nix tooling required at runtime: `nix`, `nix-build`
+- `nix eval` needs `nix-command` experimental feature enabled (e.g. `experimental-features = nix-command` in `nix.conf`)
 - See `Cargo.toml` for Rust edition, dependencies, and binary layout.
 
 ## Architecture
@@ -58,6 +59,21 @@ Build with `cargo build --release`. Runtime (requires root for `/nixfs`, or pass
 ls -l /tmp/nixfs/vim                   # test lookup + readlink
 fusermount -u /tmp/nixfs               # unmount
 ```
+
+### Nix build
+
+```bash
+nix-build --expr 'let pkgs = import <nixpkgs> {}; in pkgs.callPackage ./default.nix {}'
+```
+
+### NixOS VM test
+
+```bash
+nix-build --expr 'let pkgs = import <nixpkgs> {}; in pkgs.callPackage ./default.nix {}' \
+  -A passthru.tests.nixfs
+```
+
+Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink + binary output, unmounts.
 
 ## Style notes
 
