@@ -17,20 +17,23 @@ pointing to the Nix store path of `<nixpkgs>.vim`.
 ### Data flow (current)
 
 ```
-user command         FUSE op            nixfs action
-─────────────────────────────────────────────────────────
-ls -l /nixfs/vim     lookup("vim",1)     nix_eval_attr → insert Entry (Dir or Symlink stub)
-                      readlink(inode)    nix_build_attr → cache store path, reply symlink target
-cat /nixfs/vim/...   (follows link)     Nix daemon builds if needed (outside nixfs)
-ls /nixfs/           readdir(1)         returns only "." and ".." (directories are empty)
-ls /nixfs/python3/   readdir(dir_inode) same — explicit lookup required to see children
+user command              FUSE op            nixfs action
+──────────────────────────────────────────────────────────────────
+ls -l /nixfs/vim          lookup("vim",1)     nix_eval_attr → insert Entry (Dir or Symlink stub)
+                           readlink(inode)    nix_build_attr → cache store path, reply symlink target
+cat /nixfs/vim/...        (follows link)     Nix daemon builds if needed (outside nixfs)
+ls /nixfs/                readdir(1)         returns only "." and ".." (directories are empty)
+ls /nixfs/python3/        readdir(dir_inode) same — explicit lookup required to see children
+ls -l /nixfs/qemu.src@unpacked  lookup("qemu.src@unpacked",1)  strip @unpacked suffix, nix_eval_attr on base
+                           readlink(inode)    nix_build_src_only → unpack via pkgs.srcOnly
 ```
 
 ### Key types
 
 - **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of full dotted attr path).
-- **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path }`.
+- **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path, created, src_only }`.
   Symlink `out_path` is `None` for stub entries created by `lookup` (resolved lazily in `readlink`).
+  `src_only` is `true` when the filename ends in `@unpacked`, meaning `readlink` resolves via `pkgs.srcOnly` instead of `nix-build --attr`.
 - **Inode scheme:** `DefaultHasher` over the full dotted attr path → deterministic 64-bit inode.
 - **Root:** inode 1, always a `Dir`. All lookups target `<nixpkgs>` (hardcoded).
 
@@ -40,6 +43,7 @@ ls /nixfs/python3/   readdir(dir_inode) same — explicit lookup required to see
 |---|---|---|
 | `nix eval --raw -f '<nixpkgs>' '<attr>.outPath'` | Existence check + type detection (lookup) | No |
 | `nix-build --no-out-link --attr <attr> <nixpkgs>` | Build/substitute derivation → store path (readlink) | Yes |
+| `nix-build --no-out-link --expr '… srcOnly { name = <attr>.name; src = <attr>; }'` | Unpack source archive (readlink for @unpacked entries) | Yes |
 
 ### Path resolution
 
@@ -49,6 +53,7 @@ Filenames are used directly as Nixpkgs attribute names. No path manipulation nee
 |---|---|---|
 | `vim` | `nix eval --raw -f '<nixpkgs>' 'vim.outPath'` | `nix-build --no-out-link --attr vim <nixpkgs>` |
 | `python3Packages.numpy` | `nix eval --raw -f '<nixpkgs>' 'python3Packages.numpy.outPath'` | `nix-build --no-out-link --attr python3Packages.numpy <nixpkgs>` |
+| `qemu.src@unpacked` | `nix eval --raw -f '<nixpkgs>' 'qemu.src.outPath'` | `nix-build --expr '… srcOnly { name = qemu.src.name; src = qemu.src; }'` |
 
 ## Build & test
 

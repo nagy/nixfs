@@ -43,6 +43,8 @@ enum EntryKind {
         out_path: Option<String>,
         /// When this store path was last resolved.
         created: Instant,
+        /// Whether to resolve via srcOnly (unpack source) instead of nix-build --attr.
+        src_only: bool,
     },
     /// A Nix attribute set — appears as a directory.
     Dir {
@@ -153,6 +155,38 @@ fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
     }
 }
 
+/// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>; }'`.
+/// Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
+/// Returns the store path to the unpacked source directory.
+fn nix_build_src_only(attr_path: &str) -> Result<String, i32> {
+    let expr = format!(
+        "with import <nixpkgs> {{}}; srcOnly {{ name = {attr_path}.name; src = {attr_path}; }}"
+    );
+    eprintln!("Building srcOnly: {attr_path:?}");
+    let output = std::process::Command::new("nix-build")
+        .arg("--no-out-link")
+        .arg("--expr")
+        .arg(&expr)
+        .output();
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .map(|s| s.trim_end_matches('\n').to_string())
+                    .map_err(|_| EIO)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                eprintln!("nix_build_src_only failed: {stderr}");
+                Err(classify_eval_error(&stderr))
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to spawn nix-build: {e}");
+            Err(EIO)
+        }
+    }
+}
+
 /// Maps `nix eval` stderr to a specific errno.
 fn classify_eval_error(stderr: &str) -> i32 {
     if stderr.contains("does not provide attribute")
@@ -184,18 +218,29 @@ impl fuser::Filesystem for NixFS {
             return;
         };
         // Reject names that look like dotfiles — invalid as Nix attr names.
-        if child_name.starts_with('.') || child_name.ends_with('.') {
-            reply.error(EINVAL);
-            return;
-        }
-        eprintln!("Lookup: {child_name:?} in parent {parent}");
-
-        // Build the full dotted attr path for this child.
-        let child_path = if parent == 1 {
-            // Root directory — attr path is just the name.
-            child_name.to_string()
+        // Allow '@unpacked' suffix for extended operations.
+        let (child_name, src_only) = if let Some(base) = child_name.strip_suffix("@unpacked") {
+            if base.is_empty() || base.starts_with('.') || base.ends_with('.') {
+                reply.error(EINVAL);
+                return;
+            }
+            (base, true)
         } else {
-            // Subdirectory — join parent path + "." + name.
+            if child_name.starts_with('.') || child_name.ends_with('.') {
+                reply.error(EINVAL);
+                return;
+            }
+            (child_name, false)
+        };
+        eprintln!(
+            "Lookup: {child_name:?} in parent {parent}{}",
+            if src_only { " [src_only]" } else { "" }
+        );
+
+        // Resolve parent attr path for non-root lookups.
+        let parent_attr = if parent == 1 {
+            None
+        } else {
             let Some(parent_entry) = self.entries.get(&parent) else {
                 reply.error(ENOENT);
                 return;
@@ -206,12 +251,27 @@ impl fuser::Filesystem for NixFS {
                 reply.error(ENOTDIR);
                 return;
             };
-            format!("{parent_path}.{child_name}")
+            Some(parent_path.to_string())
         };
 
-        let inode = inode_for_attr_path(&child_path);
+        // Build the full dotted attr path (without @suffix) for nix eval/building.
+        let child_path = if let Some(ref parent_path) = parent_attr {
+            format!("{parent_path}.{child_name}")
+        } else {
+            child_name.to_string()
+        };
 
-        // If we already have an entry (created by readdir), just reply with it.
+        // Inode must include the @unpacked suffix (if any) for uniqueness,
+        // so hash the original name, not the stripped child_name.
+        let orig_name = name.to_str().unwrap();
+        let full_inode_path = if let Some(ref parent_path) = parent_attr {
+            format!("{parent_path}.{orig_name}")
+        } else {
+            orig_name.to_string()
+        };
+        let inode = inode_for_attr_path(&full_inode_path);
+
+        // If we already have an entry, just reply with it.
         if let Some(entry) = self.entries.get(&inode) {
             let attr = match &entry.kind {
                 EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
@@ -233,6 +293,7 @@ impl fuser::Filesystem for NixFS {
                             attr_path: child_path,
                             out_path: None, // built on first readlink
                             created: Instant::now(),
+                            src_only,
                         },
                     },
                 );
@@ -277,11 +338,19 @@ impl fuser::Filesystem for NixFS {
                     attr_path,
                     out_path,
                     created,
+                    src_only,
                 } => {
                     let need_resolve = out_path.is_none() || created.elapsed() > CACHE_TTL;
-                    if need_resolve && let Ok(path) = nix_build_attr(attr_path) {
-                        *created = Instant::now();
-                        *out_path = Some(path);
+                    if need_resolve {
+                        let result = if *src_only {
+                            nix_build_src_only(attr_path)
+                        } else {
+                            nix_build_attr(attr_path)
+                        };
+                        if let Ok(path) = result {
+                            *created = Instant::now();
+                            *out_path = Some(path);
+                        }
                     }
                     // else: keep stale path if build fails.
                     match out_path {
