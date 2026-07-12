@@ -125,16 +125,12 @@ fn nix_eval_attr(attr_path: &str) -> EvalResult {
     }
 }
 
-/// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
-/// build (or substitute) the derivation. Returns the store path on success,
-/// or an errno on failure. Used in `readlink` so the symlink target exists.
-fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
-    eprintln!("Building: {attr_path:?} from {NIXPKGS:?}");
+/// Shared helper: spawns `nix-build --no-out-link` with extra arguments,
+/// returns the trimmed store path or an errno.
+fn nix_build(extra_args: &[&str]) -> Result<String, i32> {
     let output = std::process::Command::new("nix-build")
         .arg("--no-out-link")
-        .arg("--attr")
-        .arg(attr_path)
-        .arg(NIXPKGS)
+        .args(extra_args)
         .output();
     match output {
         Ok(output) => {
@@ -144,7 +140,7 @@ fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
                     .map_err(|_| EIO)
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-                eprintln!("nix_build_attr failed: {stderr}");
+                eprintln!("nix_build failed: {stderr}");
                 Err(classify_eval_error(&stderr))
             }
         }
@@ -155,6 +151,14 @@ fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
     }
 }
 
+/// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
+/// build (or substitute) the derivation. Returns the store path on success,
+/// or an errno on failure. Used in `readlink` so the symlink target exists.
+fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
+    eprintln!("Building: {attr_path:?} from {NIXPKGS:?}");
+    nix_build(&["--attr", attr_path, NIXPKGS])
+}
+
 /// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>; }'`.
 /// Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
 /// Returns the store path to the unpacked source directory.
@@ -163,28 +167,7 @@ fn nix_build_src_only(attr_path: &str) -> Result<String, i32> {
         "with import <nixpkgs> {{}}; srcOnly {{ name = {attr_path}.name; src = {attr_path}; }}"
     );
     eprintln!("Building srcOnly: {attr_path:?}");
-    let output = std::process::Command::new("nix-build")
-        .arg("--no-out-link")
-        .arg("--expr")
-        .arg(&expr)
-        .output();
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .map(|s| s.trim_end_matches('\n').to_string())
-                    .map_err(|_| EIO)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-                eprintln!("nix_build_src_only failed: {stderr}");
-                Err(classify_eval_error(&stderr))
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to spawn nix-build: {e}");
-            Err(EIO)
-        }
-    }
+    nix_build(&["--expr", &expr])
 }
 
 /// Maps `nix eval` stderr to a specific errno.
