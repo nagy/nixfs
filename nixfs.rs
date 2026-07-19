@@ -392,6 +392,11 @@ impl fuser::Filesystem for NixFS {
             }
         }
         reply.ok();
+        reply.ok();
+    }
+
+    fn forget(&mut self, _req: &Request, ino: u64, _nlookup: u64) {
+        self.entries.remove(&ino);
     }
 }
 

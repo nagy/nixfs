@@ -85,3 +85,10 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
 - Single file for now; modules planned.
 - `eprintln!` used for debug logging (visible on stderr of the mount process).
 - No async runtime — FUSE ops are synchronous and single-threaded.
+
+## Future investigation
+
+- **Nix daemon protocol instead of subprocesses.** Every `lookup` spawns `nix eval`, every `readlink` spawns `nix-build`. Talking to the Nix daemon socket directly (or using a crate) would eliminate fork/exec overhead and give structured error handling instead of scraping stderr. Investigate `nix-sys` or similar.
+- **Surface build errors to users.** When `nix-build` fails in `readlink`, the user gets `EIO`. The actual error goes only to the mount process's stderr (usually backgrounded). Options: store the error in the entry and expose via `getxattr`, or symlink to a synthetic error file.
+- **Bounded cache with eviction.** `entries` is an unbounded `HashMap`. Simple FIFO eviction: add a `Vec<u64>` insertion-order queue, push on insert, pop front + remove from map when over `MAX_ENTRIES`. No new deps needed, no threads needed. Upgrade to LRU by moving to back on access instead of just on insert.
+- **readdir with attrNames.** `builtins.attrNames` would list directory contents (no build, pure eval), but `ls -l` would still trigger `readlink` → `nix-build` on every entry. Keep `out_path=None` stubs in readdir so plain `ls` works for discovery without builds. Add a per-page entry limit. Tab-completion (readdir only, no readlink) would work safely.
