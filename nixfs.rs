@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request};
@@ -83,7 +84,7 @@ enum AttrKind {
 /// Evaluates the derivation (no build) — fast, but the resulting store path
 /// may not exist yet if the derivation hasn't been built or substituted.
 /// Used in `lookup` for existence checking.
-fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, i32> {
+fn nix_eval_attr(attr_path: &str) -> io::Result<AttrKind> {
     let expr = format!("{attr_path}.outPath");
     eprintln!("Evaluating: {expr:?} from {NIXPKGS:?}");
     let output = std::process::Command::new(NIX_EXECUTABLE)
@@ -95,10 +96,15 @@ fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, i32> {
         .output()
         .map_err(|e| {
             eprintln!("Failed to spawn nix: {e}");
-            EIO
+            io::Error::new(io::ErrorKind::Other, format!("spawn nix: {e}"))
         })?;
     if output.status.success() {
-        let s = String::from_utf8(output.stdout).map_err(|_| EIO)?;
+        let s = String::from_utf8(output.stdout).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("nix eval non-UTF-8 output: {e}"),
+            )
+        })?;
         Ok(AttrKind::Symlink(s.trim_end_matches('\n').to_string()))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
@@ -111,37 +117,42 @@ fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, i32> {
         if stderr.contains("value is a set") || stderr.contains("'outpath' in selection path") {
             Ok(AttrKind::Directory)
         } else {
-            Err(classify_eval_error(&stderr))
+            Err(io::Error::from_raw_os_error(classify_eval_error(&stderr)))
         }
     }
 }
 
 /// Shared helper: spawns `nix-build --no-out-link` with extra arguments,
 /// returns the trimmed store path or an errno.
-fn nix_build(extra_args: &[&str]) -> Result<String, i32> {
+fn nix_build(extra_args: &[&str]) -> io::Result<String> {
     let output = std::process::Command::new("nix-build")
         .arg("--no-out-link")
         .args(extra_args)
         .output()
         .map_err(|e| {
             eprintln!("Failed to spawn nix-build: {e}");
-            EIO
+            io::Error::new(io::ErrorKind::Other, format!("spawn nix-build: {e}"))
         })?;
     if output.status.success() {
         String::from_utf8(output.stdout)
             .map(|s| s.trim_end_matches('\n').to_string())
-            .map_err(|_| EIO)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("nix-build non-UTF-8 output: {e}"),
+                )
+            })
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
         eprintln!("nix_build failed: {stderr}");
-        Err(classify_eval_error(&stderr))
+        Err(io::Error::from_raw_os_error(classify_eval_error(&stderr)))
     }
 }
 
 /// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
 /// build (or substitute) the derivation. Returns the store path on success,
 /// or an errno on failure. Used in `readlink` so the symlink target exists.
-fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
+fn nix_build_attr(attr_path: &str) -> io::Result<String> {
     eprintln!("Building: {attr_path:?} from {NIXPKGS:?}");
     nix_build(&["--attr", attr_path, NIXPKGS])
 }
@@ -149,7 +160,7 @@ fn nix_build_attr(attr_path: &str) -> Result<String, i32> {
 /// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>; }'`.
 /// Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
 /// Returns the store path to the unpacked source directory.
-fn nix_build_src_only(attr_path: &str) -> Result<String, i32> {
+fn nix_build_src_only(attr_path: &str) -> io::Result<String> {
     let expr = format!(
         "with import <nixpkgs> {{}}; srcOnly {{ name = {attr_path}.name; src = {attr_path}; }}"
     );
@@ -280,8 +291,8 @@ impl fuser::Filesystem for NixFS {
                     },
                 );
             }
-            Err(errno) => {
-                reply.error(errno);
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(EIO));
             }
         }
     }
@@ -328,9 +339,9 @@ impl fuser::Filesystem for NixFS {
                                 *out_path = Some(path);
                                 *error = None;
                             }
-                            Err(errno) => {
+                            Err(e) => {
                                 *created = Instant::now();
-                                *error = Some(std::io::Error::from_raw_os_error(errno).to_string());
+                                *error = Some(e.to_string());
                             }
                         }
                     }
