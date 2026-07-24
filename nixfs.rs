@@ -97,7 +97,7 @@ fn nix_eval_attr(attr_path: &str) -> io::Result<AttrKind> {
     if output.status.success() {
         Ok(AttrKind::Derivation)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("nix_eval_attr failed (status {}): {stderr}", output.status);
         // If nix eval failed because it's a set, treat as a directory.
         // Two patterns:
@@ -133,7 +133,7 @@ fn nix_build(extra_args: &[&str]) -> io::Result<String> {
                 )
             })
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("nix_build failed: {stderr}");
         Err(io::Error::from_raw_os_error(classify_eval_error(&stderr)))
     }
@@ -160,6 +160,7 @@ fn nix_build_src_only(attr_path: &str) -> io::Result<String> {
 
 /// Maps `nix eval` stderr to a specific errno.
 fn classify_eval_error(stderr: &str) -> i32 {
+    let stderr = stderr.to_lowercase();
     if stderr.contains("does not provide attribute")
         || stderr.contains("attribute '") && stderr.contains("' missing")
         || stderr.contains("does not exist")
