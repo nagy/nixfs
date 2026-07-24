@@ -69,21 +69,19 @@ fn inode_for_attr_path(attr_path: &str) -> u64 {
     hasher.finish()
 }
 
-/// Result of evaluating a Nix attr at a given dotted path.
-enum EvalResult {
+/// What kind of Nix attribute exists at a given dotted path.
+enum AttrKind {
     /// The attribute is a derivation; contains its store path.
     Symlink(String),
     /// The attribute is an attr set (i.e. a directory).
     Directory,
-    /// Evaluation failed; contains the appropriate errno.
-    Err(i32),
 }
 
 /// Runs `nix eval --raw -f '<nixpkgs>' '<attr_path>.outPath'`.
 /// Evaluates the derivation (no build) — fast, but the resulting store path
 /// may not exist yet if the derivation hasn't been built or substituted.
 /// Used in `lookup` for existence checking.
-fn nix_eval_attr(attr_path: &str) -> EvalResult {
+fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, i32> {
     let expr = format!("{attr_path}.outPath");
     eprintln!("Evaluating: {expr:?} from {NIXPKGS:?}");
     let output = std::process::Command::new(NIX_EXECUTABLE)
@@ -98,8 +96,8 @@ fn nix_eval_attr(attr_path: &str) -> EvalResult {
             if output.status.success() {
                 let stdout = String::from_utf8(output.stdout).map_err(|_| EIO);
                 match stdout {
-                    Ok(s) => EvalResult::Symlink(s.trim_end_matches('\n').to_string()),
-                    Err(e) => EvalResult::Err(e),
+                    Ok(s) => Ok(AttrKind::Symlink(s.trim_end_matches('\n').to_string())),
+                    Err(_) => Err(EIO),
                 }
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
@@ -112,15 +110,15 @@ fn nix_eval_attr(attr_path: &str) -> EvalResult {
                 if stderr.contains("value is a set")
                     || stderr.contains("'outpath' in selection path")
                 {
-                    EvalResult::Directory
+                    Ok(AttrKind::Directory)
                 } else {
-                    EvalResult::Err(classify_eval_error(&stderr))
+                    Err(classify_eval_error(&stderr))
                 }
             }
         }
         Err(e) => {
             eprintln!("Failed to spawn nix: {e}");
-            EvalResult::Err(EIO)
+            Err(EIO)
         }
     }
 }
@@ -265,7 +263,7 @@ impl fuser::Filesystem for NixFS {
         }
 
         match nix_eval_attr(&child_path) {
-            EvalResult::Symlink(_out_path) => {
+            Ok(AttrKind::Symlink(_out_path)) => {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
                 reply.entry(&Duration::MAX, &make_attr(inode, FileType::Symlink), 0);
@@ -281,7 +279,7 @@ impl fuser::Filesystem for NixFS {
                     },
                 );
             }
-            EvalResult::Directory => {
+            Ok(AttrKind::Directory) => {
                 reply.entry(&Duration::MAX, &make_attr(inode, FileType::Directory), 0);
                 self.entries.insert(
                     inode,
@@ -292,7 +290,7 @@ impl fuser::Filesystem for NixFS {
                     },
                 );
             }
-            EvalResult::Err(errno) => {
+            Err(errno) => {
                 reply.error(errno);
             }
         }
@@ -391,7 +389,6 @@ impl fuser::Filesystem for NixFS {
                 break;
             }
         }
-        reply.ok();
         reply.ok();
     }
 
