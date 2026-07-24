@@ -3,7 +3,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request};
+use fuser::{
+    FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
+};
 use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ETIMEDOUT};
 
 const NIX_EXECUTABLE: &str = "nix";
@@ -185,24 +187,21 @@ fn classify_eval_error(stderr: &str) -> i32 {
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // Reject non-UTF-8 names — Nix attr names are always valid UTF-8.
-        let Some(child_name) = name.to_str() else {
+        let Some(orig_name) = name.to_str() else {
             reply.error(EINVAL);
             return;
         };
         // Reject names that look like dotfiles — invalid as Nix attr names.
         // Allow '@unpacked' suffix for extended operations.
-        let (child_name, src_only) = if let Some(base) = child_name.strip_suffix("@unpacked") {
-            if base.is_empty() || base.starts_with('.') || base.ends_with('.') {
-                reply.error(EINVAL);
-                return;
-            }
+        let (child_name, src_only) = if let Some(base) = orig_name.strip_suffix("@unpacked") {
             (base, true)
         } else {
-            if child_name.starts_with('.') || child_name.ends_with('.') {
-                reply.error(EINVAL);
-                return;
-            }
-            (child_name, false)
+            (orig_name, false)
+        };
+        // Validate after stripping suffix.
+        if child_name.is_empty() || child_name.starts_with('.') || child_name.ends_with('.') {
+            reply.error(EINVAL);
+            return;
         };
         eprintln!(
             "Lookup: {child_name:?} in parent {parent}{}",
@@ -235,7 +234,6 @@ impl fuser::Filesystem for NixFS {
 
         // Inode must include the @unpacked suffix (if any) for uniqueness,
         // so hash the original name, not the stripped child_name.
-        let orig_name = name.to_str().unwrap();
         let full_inode_path = if let Some(ref parent_path) = parent_attr {
             format!("{parent_path}.{orig_name}")
         } else {
@@ -428,7 +426,6 @@ impl fuser::Filesystem for NixFS {
 }
 
 fn main() {
-    use fuser::MountOption;
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "-h" || a == "--help") {
