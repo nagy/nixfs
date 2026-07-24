@@ -56,13 +56,9 @@ enum EntryKind {
     },
 }
 
-struct Entry {
-    kind: EntryKind,
-}
-
 #[derive(Default)]
 struct NixFS {
-    entries: std::collections::HashMap<u64, Entry>,
+    entries: std::collections::HashMap<u64, EntryKind>,
 }
 
 /// Hash an attribute path to a deterministic 64-bit inode.
@@ -220,7 +216,7 @@ impl fuser::Filesystem for NixFS {
                 reply.error(ENOENT);
                 return;
             };
-            let parent_path = if let EntryKind::Dir { attr_path, .. } = &parent_entry.kind {
+            let parent_path = if let EntryKind::Dir { attr_path, .. } = parent_entry {
                 attr_path.as_str()
             } else {
                 reply.error(ENOTDIR);
@@ -248,7 +244,7 @@ impl fuser::Filesystem for NixFS {
 
         // If we already have an entry, just reply with it.
         if let Some(entry) = self.entries.get(&inode) {
-            let attr = match &entry.kind {
+            let attr = match entry {
                 EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
                 EntryKind::Dir { .. } => make_attr(inode, FileType::Directory),
             };
@@ -263,14 +259,12 @@ impl fuser::Filesystem for NixFS {
                 reply.entry(&Duration::MAX, &make_attr(inode, FileType::Symlink), 0);
                 self.entries.insert(
                     inode,
-                    Entry {
-                        kind: EntryKind::Symlink {
-                            attr_path: child_path,
-                            out_path: None, // built on first readlink
-                            created: Instant::now(),
-                            src_only,
-                            error: None,
-                        },
+                    EntryKind::Symlink {
+                        attr_path: child_path,
+                        out_path: None, // built on first readlink
+                        created: Instant::now(),
+                        src_only,
+                        error: None,
                     },
                 );
             }
@@ -278,10 +272,8 @@ impl fuser::Filesystem for NixFS {
                 reply.entry(&Duration::MAX, &make_attr(inode, FileType::Directory), 0);
                 self.entries.insert(
                     inode,
-                    Entry {
-                        kind: EntryKind::Dir {
-                            attr_path: child_path,
-                        },
+                    EntryKind::Dir {
+                        attr_path: child_path,
                     },
                 );
             }
@@ -297,7 +289,7 @@ impl fuser::Filesystem for NixFS {
             return;
         }
         if let Some(entry) = self.entries.get(&ino) {
-            let attr = match &entry.kind {
+            let attr = match entry {
                 EntryKind::Symlink { .. } => make_attr(ino, FileType::Symlink),
                 EntryKind::Dir { .. } => make_attr(ino, FileType::Directory),
             };
@@ -309,7 +301,7 @@ impl fuser::Filesystem for NixFS {
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
         if let Some(entry) = self.entries.get_mut(&inode) {
-            match &mut entry.kind {
+            match entry {
                 EntryKind::Symlink {
                     attr_path,
                     out_path,
@@ -366,11 +358,7 @@ impl fuser::Filesystem for NixFS {
         // lookup + readlink (e.g.  ls -l /nixfs/vim).
         let parent_inode = if ino == 1 {
             1
-        } else if let Some(Entry {
-            kind: EntryKind::Dir { attr_path },
-            ..
-        }) = self.entries.get(&ino)
-        {
+        } else if let Some(EntryKind::Dir { attr_path }) = self.entries.get(&ino) {
             attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
                 if parent_path.is_empty() {
                     1
@@ -414,11 +402,8 @@ impl fuser::Filesystem for NixFS {
             return;
         }
         let msg = match self.entries.get(&ino) {
-            Some(Entry {
-                kind:
-                    EntryKind::Symlink {
-                        error: Some(msg), ..
-                    },
+            Some(EntryKind::Symlink {
+                error: Some(msg), ..
             }) => msg.clone(),
             _ => {
                 reply.error(ENODATA);
@@ -431,9 +416,7 @@ impl fuser::Filesystem for NixFS {
     fn listxattr(&mut self, _req: &Request, ino: u64, _size: u32, reply: ReplyXattr) {
         let has_error = matches!(
             self.entries.get(&ino),
-            Some(Entry {
-                kind: EntryKind::Symlink { error: Some(_), .. },
-            })
+            Some(EntryKind::Symlink { error: Some(_), .. })
         );
         if has_error {
             reply.data(b"user.error\0");
