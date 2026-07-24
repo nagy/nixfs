@@ -361,29 +361,32 @@ impl fuser::Filesystem for NixFS {
         // lookup + readlink (e.g.  ls -l /nixfs/vim).
         let parent_inode = if ino == 1 {
             1
-        } else {
-            match self.entries.get(&ino) {
-                Some(Entry {
-                    kind: EntryKind::Dir { attr_path },
-                    ..
-                }) => attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
-                    if parent_path.is_empty() {
-                        1
-                    } else {
-                        inode_for_attr_path(parent_path)
-                    }
-                }),
-                _ => {
-                    reply.error(ENOTDIR);
-                    return;
+        } else if let Some(Entry {
+            kind: EntryKind::Dir { attr_path },
+            ..
+        }) = self.entries.get(&ino)
+        {
+            attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
+                if parent_path.is_empty() {
+                    1
+                } else {
+                    inode_for_attr_path(parent_path)
                 }
-            }
+            })
+        } else {
+            reply.error(ENOTDIR);
+            return;
         };
 
         let entries = [
             (ino, FileType::Directory, "."),
             (parent_inode, FileType::Directory, ".."),
         ];
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_wrap
+        )]
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
                 break;
