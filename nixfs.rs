@@ -90,35 +90,26 @@ fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, i32> {
         .arg("-f")
         .arg(NIXPKGS)
         .arg(&expr)
-        .output();
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8(output.stdout).map_err(|_| EIO);
-                match stdout {
-                    Ok(s) => Ok(AttrKind::Symlink(s.trim_end_matches('\n').to_string())),
-                    Err(_) => Err(EIO),
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-                eprintln!("nix_eval_attr failed (status {}): {stderr}", output.status);
-                // If nix eval failed because it's a set, treat as a directory.
-                // Two patterns:
-                //   - "value is a set"  (old nix versions)
-                //   - "attribute 'outpath' in selection path '...outpath' not found"
-                //     (newer nix — means the attr exists but isn't a derivation)
-                if stderr.contains("value is a set")
-                    || stderr.contains("'outpath' in selection path")
-                {
-                    Ok(AttrKind::Directory)
-                } else {
-                    Err(classify_eval_error(&stderr))
-                }
-            }
-        }
-        Err(e) => {
+        .output()
+        .map_err(|e| {
             eprintln!("Failed to spawn nix: {e}");
-            Err(EIO)
+            EIO
+        })?;
+    if output.status.success() {
+        let s = String::from_utf8(output.stdout).map_err(|_| EIO)?;
+        Ok(AttrKind::Symlink(s.trim_end_matches('\n').to_string()))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        eprintln!("nix_eval_attr failed (status {}): {stderr}", output.status);
+        // If nix eval failed because it's a set, treat as a directory.
+        // Two patterns:
+        //   - "value is a set"  (old nix versions)
+        //   - "attribute 'outpath' in selection path '...outpath' not found"
+        //     (newer nix — means the attr exists but isn't a derivation)
+        if stderr.contains("value is a set") || stderr.contains("'outpath' in selection path") {
+            Ok(AttrKind::Directory)
+        } else {
+            Err(classify_eval_error(&stderr))
         }
     }
 }
@@ -129,23 +120,19 @@ fn nix_build(extra_args: &[&str]) -> Result<String, i32> {
     let output = std::process::Command::new("nix-build")
         .arg("--no-out-link")
         .args(extra_args)
-        .output();
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .map(|s| s.trim_end_matches('\n').to_string())
-                    .map_err(|_| EIO)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-                eprintln!("nix_build failed: {stderr}");
-                Err(classify_eval_error(&stderr))
-            }
-        }
-        Err(e) => {
+        .output()
+        .map_err(|e| {
             eprintln!("Failed to spawn nix-build: {e}");
-            Err(EIO)
-        }
+            EIO
+        })?;
+    if output.status.success() {
+        String::from_utf8(output.stdout)
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .map_err(|_| EIO)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        eprintln!("nix_build failed: {stderr}");
+        Err(classify_eval_error(&stderr))
     }
 }
 
