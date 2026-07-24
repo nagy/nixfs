@@ -403,6 +403,19 @@ impl fuser::Filesystem for NixFS {
 fn main() {
     use fuser::MountOption;
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        eprintln!(
+            "Usage: {} [mountpoint]\n\
+             \n\
+             Mount Nix package attributes as a FUSE filesystem.\n\
+             \n\
+             If no mountpoint is given, defaults to /nixfs.\n",
+            args.first().map_or("nixfs", String::as_str)
+        );
+        std::process::exit(0);
+    }
+
     let mount_path = args.get(1).map_or("/nixfs", String::as_str);
     if let Err(e) = fuser::mount2(
         NixFS::default(),
