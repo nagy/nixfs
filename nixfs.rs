@@ -74,8 +74,8 @@ fn inode_for_attr_path(attr_path: &str) -> u64 {
 
 /// What kind of Nix attribute exists at a given dotted path.
 enum AttrKind {
-    /// The attribute is a derivation; contains its store path.
-    Symlink(String),
+    /// The attribute is a derivation.
+    Derivation,
     /// The attribute is an attr set (i.e. a directory).
     Directory,
 }
@@ -99,13 +99,7 @@ fn nix_eval_attr(attr_path: &str) -> io::Result<AttrKind> {
             io::Error::new(io::ErrorKind::Other, format!("spawn nix: {e}"))
         })?;
     if output.status.success() {
-        let s = String::from_utf8(output.stdout).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("nix eval non-UTF-8 output: {e}"),
-            )
-        })?;
-        Ok(AttrKind::Symlink(s.trim_end_matches('\n').to_string()))
+        Ok(AttrKind::Derivation)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
         eprintln!("nix_eval_attr failed (status {}): {stderr}", output.status);
@@ -263,7 +257,7 @@ impl fuser::Filesystem for NixFS {
         }
 
         match nix_eval_attr(&child_path) {
-            Ok(AttrKind::Symlink(_out_path)) => {
+            Ok(AttrKind::Derivation) => {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
                 reply.entry(&Duration::MAX, &make_attr(inode, FileType::Symlink), 0);
