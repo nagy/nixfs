@@ -31,9 +31,10 @@ ls -l /nixfs/qemu.src@unpacked  lookup("qemu.src@unpacked",1)  strip @unpacked s
 ### Key types
 
 - **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of full dotted attr path).
-- **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path, created, src_only }`.
+- **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path, created, src_only, error }`.
   Symlink `out_path` is `None` for stub entries created by `lookup` (resolved lazily in `readlink`).
   `src_only` is `true` when the filename ends in `@unpacked`, meaning `readlink` resolves via `pkgs.srcOnly` instead of `nix-build --attr`.
+  `error` is `None` on success/untried; `Some(msg)` after a failed build (retried after `CACHE_TTL`).
 - **Inode scheme:** `DefaultHasher` over the full dotted attr path → deterministic 64-bit inode.
 - **Root:** inode 1, always a `Dir`. All lookups target `<nixpkgs>` (hardcoded).
 
@@ -89,6 +90,6 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
 ## Future investigation
 
 - **Nix daemon protocol instead of subprocesses.** Every `lookup` spawns `nix eval`, every `readlink` spawns `nix-build`. Talking to the Nix daemon socket directly (or using a crate) would eliminate fork/exec overhead and give structured error handling instead of scraping stderr. Investigate `nix-sys` or similar.
-- **Surface build errors to users.** When `nix-build` fails in `readlink`, the user gets `EIO`. The actual error goes only to the mount process's stderr (usually backgrounded). Options: store the error in the entry and expose via `getxattr`, or symlink to a synthetic error file.
+- **Surface build errors to users (done partially).** The `error` field stashes the errno message, and `getxattr`/`listxattr` expose it via `user.error`. Remaining: format the actual Nix stderr message instead of just the generic OS errno string, and optionally symlink to a synthetic error file for users without `getfattr`.
 - **Bounded cache with eviction.** `entries` is an unbounded `HashMap`. Simple FIFO eviction: add a `Vec<u64>` insertion-order queue, push on insert, pop front + remove from map when over `MAX_ENTRIES`. No new deps needed, no threads needed. Upgrade to LRU by moving to back on access instead of just on insert.
 - **readdir with attrNames.** `builtins.attrNames` would list directory contents (no build, pure eval), but `ls -l` would still trigger `readlink` → `nix-build` on every entry. Keep `out_path=None` stubs in readdir so plain `ls` works for discovery without builds. Add a per-page entry limit. Tab-completion (readdir only, no readlink) would work safely.

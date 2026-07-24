@@ -2,8 +2,8 @@ use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, Request};
-use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENOENT, ENOTDIR, ETIMEDOUT};
+use fuser::{FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request};
+use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ETIMEDOUT};
 
 const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
@@ -41,10 +41,12 @@ enum EntryKind {
         attr_path: String,
         /// Cached store path. None if created by readdir (resolved lazily).
         out_path: Option<String>,
-        /// When this store path was last resolved.
+        /// When this store path was last resolved (or last attempted).
         created: Instant,
         /// Whether to resolve via srcOnly (unpack source) instead of nix-build --attr.
         src_only: bool,
+        /// Error message from the last failed build attempt.  None on success or untried.
+        error: Option<String>,
     },
     /// A Nix attribute set — appears as a directory.
     Dir {
@@ -262,6 +264,7 @@ impl fuser::Filesystem for NixFS {
                             out_path: None, // built on first readlink
                             created: Instant::now(),
                             src_only,
+                            error: None,
                         },
                     },
                 );
@@ -307,20 +310,30 @@ impl fuser::Filesystem for NixFS {
                     out_path,
                     created,
                     src_only,
+                    error,
                 } => {
-                    let need_resolve = out_path.is_none() || created.elapsed() > CACHE_TTL;
+                    // Resolve if untried (no out_path yet, no error recorded)
+                    // or the last attempt is stale.
+                    let need_resolve =
+                        (out_path.is_none() && error.is_none()) || created.elapsed() > CACHE_TTL;
                     if need_resolve {
                         let result = if *src_only {
                             nix_build_src_only(attr_path)
                         } else {
                             nix_build_attr(attr_path)
                         };
-                        if let Ok(path) = result {
-                            *created = Instant::now();
-                            *out_path = Some(path);
+                        match result {
+                            Ok(path) => {
+                                *created = Instant::now();
+                                *out_path = Some(path);
+                                *error = None;
+                            }
+                            Err(errno) => {
+                                *created = Instant::now();
+                                *error = Some(std::io::Error::from_raw_os_error(errno).to_string());
+                            }
                         }
                     }
-                    // else: keep stale path if build fails.
                     match out_path {
                         Some(path) => reply.data(path.as_bytes()),
                         None => reply.error(EIO),
@@ -384,6 +397,44 @@ impl fuser::Filesystem for NixFS {
 
     fn forget(&mut self, _req: &Request, ino: u64, _nlookup: u64) {
         self.entries.remove(&ino);
+    }
+
+    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, _size: u32, reply: ReplyXattr) {
+        let Some(name_str) = name.to_str() else {
+            reply.error(ENODATA);
+            return;
+        };
+        if name_str != "user.error" {
+            reply.error(ENODATA);
+            return;
+        }
+        let msg = match self.entries.get(&ino) {
+            Some(Entry {
+                kind:
+                    EntryKind::Symlink {
+                        error: Some(msg), ..
+                    },
+            }) => msg.clone(),
+            _ => {
+                reply.error(ENODATA);
+                return;
+            }
+        };
+        reply.data(msg.as_bytes());
+    }
+
+    fn listxattr(&mut self, _req: &Request, ino: u64, _size: u32, reply: ReplyXattr) {
+        let has_error = matches!(
+            self.entries.get(&ino),
+            Some(Entry {
+                kind: EntryKind::Symlink { error: Some(_), .. },
+            })
+        );
+        if has_error {
+            reply.data(b"user.error\0");
+        } else {
+            reply.data(b"");
+        }
     }
 }
 
