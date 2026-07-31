@@ -1,12 +1,10 @@
-use std::ffi::OsStr;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io;
-use std::time::{Duration, Instant, UNIX_EPOCH};
-
 use fuser::{
     FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
 };
 use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ETIMEDOUT};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
@@ -48,8 +46,9 @@ enum EntryKind {
         created: Instant,
         /// Whether to resolve via srcOnly (unpack source) instead of nix-build --attr.
         src_only: bool,
-        /// Error message from the last failed build attempt.  None on success or untried.
-        error: Option<String>,
+        /// Last failed build: (errno, message).  None on success or untried.
+        /// `readlink` replies the errno; the `user.error` xattr shows the message.
+        error: Option<(i32, String)>,
     },
     /// A Nix attribute set — appears as a directory.
     Dir {
@@ -60,14 +59,22 @@ enum EntryKind {
 
 #[derive(Default)]
 struct NixFS {
-    entries: std::collections::HashMap<u64, EntryKind>,
+    entries: HashMap<u64, EntryKind>,
 }
+
+// FNV-1a 64-bit: deterministic across processes and remounts, unlike
+// DefaultHasher (which is randomly seeded per-process).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Hash an attribute path to a deterministic 64-bit inode.
 fn inode_for_attr_path(attr_path: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    attr_path.hash(&mut hasher);
-    hasher.finish()
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in attr_path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// What kind of Nix attribute exists at a given dotted path.
@@ -82,7 +89,7 @@ enum AttrKind {
 /// Evaluates the derivation (no build) — fast, but the resulting store path
 /// may not exist yet if the derivation hasn't been built or substituted.
 /// Used in `lookup` for existence checking.
-fn nix_eval_attr(attr_path: &str) -> io::Result<AttrKind> {
+fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, NixError> {
     let expr = format!("{attr_path}.outPath");
     eprintln!("Evaluating: {expr:?} from {NIXPKGS:?}");
     let output = std::process::Command::new(NIX_EXECUTABLE)
@@ -94,57 +101,60 @@ fn nix_eval_attr(attr_path: &str) -> io::Result<AttrKind> {
         .output()
         .map_err(|e| {
             eprintln!("Failed to spawn nix: {e}");
-            io::Error::new(io::ErrorKind::Other, format!("spawn nix: {e}"))
+            NixError {
+                errno: EIO,
+                message: format!("spawn nix: {e}"),
+            }
         })?;
     if output.status.success() {
         Ok(AttrKind::Derivation)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("nix_eval_attr failed (status {}): {stderr}", output.status);
-        // If nix eval failed because it's a set, treat as a directory.
-        // Two patterns:
-        //   - "value is a set"  (old nix versions)
-        //   - "attribute 'outpath' in selection path '...outpath' not found"
-        //     (newer nix — means the attr exists but isn't a derivation)
-        if stderr.contains("value is a set") || stderr.contains("'outpath' in selection path") {
-            Ok(AttrKind::Directory)
-        } else {
-            Err(io::Error::from_raw_os_error(classify_eval_error(&stderr)))
-        }
+        // If nix eval failed because it's a set, treat as a directory
+        // (classify_nix_stderr returns None for that case).
+        classify_nix_stderr(&stderr).map_or(Ok(AttrKind::Directory), Err)
     }
 }
 
 /// Shared helper: spawns `nix-build --no-out-link` with extra arguments,
 /// returns the trimmed store path or an errno.
-fn nix_build(extra_args: &[&str]) -> io::Result<String> {
+fn nix_build(extra_args: &[&str]) -> Result<String, NixError> {
     let output = std::process::Command::new("nix-build")
         .arg("--no-out-link")
         .args(extra_args)
         .output()
         .map_err(|e| {
             eprintln!("Failed to spawn nix-build: {e}");
-            io::Error::new(io::ErrorKind::Other, format!("spawn nix-build: {e}"))
+            NixError {
+                errno: EIO,
+                message: format!("spawn nix-build: {e}"),
+            }
         })?;
     if output.status.success() {
         String::from_utf8(output.stdout)
             .map(|s| s.trim_end_matches('\n').to_string())
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("nix-build non-UTF-8 output: {e}"),
-                )
+            .map_err(|e| NixError {
+                errno: EIO,
+                message: format!("nix-build non-UTF-8 output: {e}"),
             })
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("nix_build failed: {stderr}");
-        Err(io::Error::from_raw_os_error(classify_eval_error(&stderr)))
+        Err(classify_nix_stderr(&stderr).unwrap_or_else(|| {
+            // classify_nix_stderr returns None only for the "is a set" case,
+            // which can't happen here (nix-build fails differently).
+            NixError {
+                errno: EIO,
+                message: stderr.trim().to_string(),
+            }
+        }))
     }
 }
-
 /// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
 /// build (or substitute) the derivation. Returns the store path on success,
 /// or an errno on failure. Used in `readlink` so the symlink target exists.
-fn nix_build_attr(attr_path: &str) -> io::Result<String> {
+fn nix_build_attr(attr_path: &str) -> Result<String, NixError> {
     eprintln!("Building: {attr_path:?} from {NIXPKGS:?}");
     nix_build(&["--attr", attr_path, NIXPKGS])
 }
@@ -152,7 +162,7 @@ fn nix_build_attr(attr_path: &str) -> io::Result<String> {
 /// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>; }'`.
 /// Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
 /// Returns the store path to the unpacked source directory.
-fn nix_build_src_only(attr_path: &str) -> io::Result<String> {
+fn nix_build_src_only(attr_path: &str) -> Result<String, NixError> {
     let expr = format!(
         "with import <nixpkgs> {{}}; srcOnly {{ name = {attr_path}.name; src = {attr_path}; }}"
     );
@@ -160,27 +170,68 @@ fn nix_build_src_only(attr_path: &str) -> io::Result<String> {
     nix_build(&["--expr", &expr])
 }
 
-/// Maps `nix eval` stderr to a specific errno.
+/// Classified result of a failed `nix eval`/`nix-build` invocation:
+/// the errno to reply to FUSE, plus the actual stderr message.
+#[derive(Debug, PartialEq)]
+struct NixError {
+    errno: i32,
+    message: String,
+}
+
+/// Maps `nix eval`/`nix-build` stderr to a specific errno.
 fn classify_eval_error(stderr: &str) -> i32 {
-    let stderr = stderr.to_lowercase();
+    // Match the final `error:` line, not build-log noise: bare words like
+    // "network" appear in unrelated messages (e.g. network namespaces).
     if stderr.contains("does not provide attribute")
-        || stderr.contains("attribute '") && stderr.contains("' missing")
+        // Parenthesized: && binds tighter than || in this chain.
+        || (stderr.contains("attribute '") && stderr.contains("' missing"))
+        || stderr.contains("not found")
         || stderr.contains("does not exist")
+        // `nix-build --expr '… srcOnly { … }'` reports a missing attr as
+        // an undefined variable rather than "not found".
+        || stderr.contains("undefined variable")
     {
         ENOENT
     } else if stderr.contains("timed out") || stderr.contains("timeout") {
         ETIMEDOUT
     } else if stderr.contains("could not resolve")
-        || stderr.contains("unreachable")
-        || stderr.contains("network")
         || stderr.contains("connection refused")
         || stderr.contains("name or service not known")
+        // Full errno strings (ENETUNREACH / EHOSTUNREACH) instead of the
+        // bare "network"/"unreachable": those match unrelated build noise.
+        || stderr.contains("network is unreachable")
+        || stderr.contains("network unreachable")
+        || stderr.contains("no route to host")
+        || stderr.contains("host is unreachable")
+        || stderr.contains("host unreachable")
     {
         ENETUNREACH
     } else if stderr.contains("permission denied") || stderr.contains("access denied") {
         EACCES
     } else {
         EIO
+    }
+}
+
+/// Returns a `NixError` classified from `stderr`, or `None` if the stderr
+/// indicates a *successful* evaluation of a non-derivation (an attr set),
+/// which `nix_eval_attr` must treat as a directory.
+fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
+    let message = stderr.trim().to_string();
+    // If nix eval failed because it's a set, treat as a directory:
+    //   - "value is a set"  (old nix versions)
+    //   - "attribute 'outPath' in selection path '...outPath' not found"
+    //     (modern nix — means the attr exists but isn't a derivation)
+    let is_directory = stderr.contains("value is a set")
+        || stderr.contains("attribute 'outPath' in selection path")
+        || stderr.contains("'outpath' in selection path");
+    if is_directory {
+        None
+    } else {
+        Some(NixError {
+            errno: classify_eval_error(stderr),
+            message,
+        })
     }
 }
 
@@ -277,7 +328,8 @@ impl fuser::Filesystem for NixFS {
                 );
             }
             Err(e) => {
-                reply.error(e.raw_os_error().unwrap_or(EIO));
+                reply.error(e.errno);
+                // (message is available via the user.error xattr)
             }
         }
     }
@@ -326,13 +378,18 @@ impl fuser::Filesystem for NixFS {
                             }
                             Err(e) => {
                                 *created = Instant::now();
-                                *error = Some(e.to_string());
+                                *error = Some((e.errno, e.message));
                             }
                         }
                     }
                     match out_path {
                         Some(path) => reply.data(path.as_bytes()),
-                        None => reply.error(EIO),
+                        // Build failed — surface the real errno instead of a blanket
+                        // EIO (the message is available via the user.error xattr).
+                        None => match error {
+                            Some((errno, _)) => reply.error(*errno),
+                            None => reply.error(EIO),
+                        },
                     }
                 }
                 EntryKind::Dir { .. } => {
@@ -402,7 +459,8 @@ impl fuser::Filesystem for NixFS {
         }
         let msg = match self.entries.get(&ino) {
             Some(EntryKind::Symlink {
-                error: Some(msg), ..
+                error: Some((_, msg)),
+                ..
             }) => msg.clone(),
             _ => {
                 reply.error(ENODATA);
@@ -453,5 +511,94 @@ fn main() {
     ) {
         eprintln!("Failed to mount {mount_path}: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_eval_error_maps_real_nix_stderr() {
+        // Missing attribute (nix eval / nix-build --attr)
+        assert_eq!(
+            classify_eval_error(
+                "error: attribute 'noSuchAttr' in selection path 'noSuchAttr.outPath' not found"
+            ),
+            ENOENT
+        );
+        // Missing attribute via srcOnly path (undefined variable)
+        assert_eq!(
+            classify_eval_error("error: undefined variable 'noSuchAttr'"),
+            ENOENT
+        );
+        // Network unreachable
+        assert_eq!(
+            classify_eval_error("error: network is unreachable"),
+            ENETUNREACH
+        );
+        // Permission denied
+        assert_eq!(classify_eval_error("error: permission denied"), EACCES);
+        // Unknown failure → generic EIO
+        assert_eq!(classify_eval_error("error: some random failure"), EIO);
+    }
+
+    #[test]
+    fn classify_eval_error_ignores_bare_words_in_noise() {
+        // Bare "network"/"unreachable" must NOT match unrelated build noise
+        assert_eq!(
+            classify_eval_error("error: executing 'make' failed (network of the build sandbox)"),
+            EIO
+        );
+        assert_eq!(classify_eval_error("error: foo unreachable bar"), EIO);
+        // "timeout" still matches
+        assert_eq!(classify_eval_error("error: timed out"), ETIMEDOUT);
+    }
+
+    #[test]
+    fn classify_nix_stderr_distinguishes_directory() {
+        // A set (non-derivation) → None (nix_eval_attr treats it as a directory)
+        assert_eq!(
+            classify_nix_stderr(
+                "error: attribute 'outPath' in selection path 'python3Packages.outPath' not found"
+            ),
+            None
+        );
+        // A real error → Some with classified errno + raw stderr message
+        let err = classify_nix_stderr(
+            "error: attribute 'noSuchAttr' in selection path 'noSuchAttr.outPath' not found",
+        )
+        .expect("missing attr should be an error, not a directory");
+        assert_eq!(err.errno, ENOENT);
+        assert!(err.message.contains("noSuchAttr"));
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn inode_for_attr_path_is_deterministic_and_distinct() {
+        let a = inode_for_attr_path("vim");
+        let b = inode_for_attr_path("vim");
+        assert_eq!(a, b, "same path must hash to same inode");
+
+        let c = inode_for_attr_path("python3Packages.numpy");
+        assert_ne!(a, c, "different paths must hash to different inodes");
+
+        // Parent/child paths differ (dot separator), so distinct inodes
+        assert_ne!(inode_for_attr_path("python3Packages"), c);
+
+        // The '@unpacked' suffix must change the inode (lookup hashes the
+        // full name incl. suffix for uniqueness)
+        assert_ne!(
+            inode_for_attr_path("qemu.src"),
+            inode_for_attr_path("qemu.src@unpacked")
+        );
+    }
+
+    #[test]
+    fn inode_for_attr_path_avoids_zero() {
+        // Inode 0 is invalid in FUSE (reserved); the empty string must not hash to it
+        assert_ne!(inode_for_attr_path(""), 0);
+        // Non-empty real paths also must not collide with root (inode 1 is root)
+        assert_ne!(inode_for_attr_path("vim"), 1);
     }
 }

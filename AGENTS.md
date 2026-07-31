@@ -34,8 +34,9 @@ ls -l /nixfs/qemu.src@unpacked  lookup("qemu.src@unpacked",1)  strip @unpacked s
 - **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path, created, src_only, error }`.
   Symlink `out_path` is `None` for stub entries created by `lookup` (resolved lazily in `readlink`).
   `src_only` is `true` when the filename ends in `@unpacked`, meaning `readlink` resolves via `pkgs.srcOnly` instead of `nix-build --attr`.
-  `error` is `None` on success/untried; `Some(msg)` after a failed build (retried after `CACHE_TTL`).
-- **Inode scheme:** `DefaultHasher` over the full dotted attr path → deterministic 64-bit inode.
+  `error` is `None` on success/untried; `Some((errno, msg))` after a failed build (retried after `CACHE_TTL`).
+  `readlink` replies `errno` (instead of a generic `EIO`); `getxattr user.error` shows `msg`.
+- **Inode scheme:** FNV-1a 64-bit hash over the full dotted attr path → stable 64-bit inode (deterministic across processes/remounts, unlike `DefaultHasher`).
 - **Root:** inode 1, always a `Dir`. All lookups target `<nixpkgs>` (hardcoded).
 
 ### Nix commands used
@@ -86,10 +87,10 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
 - Single file for now; modules planned.
 - `eprintln!` used for debug logging (visible on stderr of the mount process).
 - No async runtime — FUSE ops are synchronous and single-threaded.
-
+- Unit tests for `classify_eval_error`, `classify_nix_stderr`, and `inode_for_attr_path` live in a `#[cfg(test)] mod tests` at the bottom of `nixfs.rs`; run with `cargo test`.
 ## Future investigation
 
 - **Nix daemon protocol instead of subprocesses.** Every `lookup` spawns `nix eval`, every `readlink` spawns `nix-build`. Talking to the Nix daemon socket directly (or using a crate) would eliminate fork/exec overhead and give structured error handling instead of scraping stderr. Investigate `nix-sys` or similar.
-- **Surface build errors to users (done partially).** The `error` field stashes the errno message, and `getxattr`/`listxattr` expose it via `user.error`. Remaining: format the actual Nix stderr message instead of just the generic OS errno string, and optionally symlink to a synthetic error file for users without `getfattr`.
+- **Surface build errors to users (mostly done).** The `error` field stashes `(errno, msg)`; `readlink` replies the errno (no more blanket `EIO`), and `getxattr`/`listxattr` expose the message via `user.error`. Nix helpers return `Result<_, NixError>` carrying both the errno and the actual stderr text (so `user.error` shows the real Nix output, not "Unknown error N"). `classify_eval_error` matches specific errno phrases (not bare words like "network") and recognizes `undefined variable` for missing attrs via the srcOnly path. Remaining: optionally symlink to a synthetic error file for users without `getfattr`.
 - **Bounded cache with eviction.** `entries` is an unbounded `HashMap`. Simple FIFO eviction: add a `Vec<u64>` insertion-order queue, push on insert, pop front + remove from map when over `MAX_ENTRIES`. No new deps needed, no threads needed. Upgrade to LRU by moving to back on access instead of just on insert.
 - **readdir with attrNames.** `builtins.attrNames` would list directory contents (no build, pure eval), but `ls -l` would still trigger `readlink` → `nix-build` on every entry. Keep `out_path=None` stubs in readdir so plain `ls` works for discovery without builds. Add a per-page entry limit. Tab-completion (readdir only, no readlink) would work safely.
