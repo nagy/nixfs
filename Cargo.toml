@@ -3,6 +3,11 @@ name = "nixfs"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+# Run pedantic by default (no `-W clippy::pedantic` needed).
+pedantic = { level = "warn", priority = -1 }
+
+
 [dependencies]
 fuser = "0.15.1"
 libc = "0.2.174"

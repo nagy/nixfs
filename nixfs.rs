@@ -253,7 +253,7 @@ impl fuser::Filesystem for NixFS {
         if child_name.is_empty() || child_name.starts_with('.') || child_name.ends_with('.') {
             reply.error(EINVAL);
             return;
-        };
+        }
         eprintln!(
             "Lookup: {child_name:?} in parent {parent}{}",
             if src_only { " [src_only]" } else { "" }
@@ -457,15 +457,15 @@ impl fuser::Filesystem for NixFS {
             reply.error(ENODATA);
             return;
         }
-        let msg = match self.entries.get(&ino) {
-            Some(EntryKind::Symlink {
-                error: Some((_, msg)),
-                ..
-            }) => msg.clone(),
-            _ => {
-                reply.error(ENODATA);
-                return;
-            }
+        let msg = if let Some(EntryKind::Symlink {
+            error: Some((_, msg)),
+            ..
+        }) = self.entries.get(&ino)
+        {
+            msg.clone()
+        } else {
+            reply.error(ENODATA);
+            return;
         };
         reply.data(msg.as_bytes());
     }
