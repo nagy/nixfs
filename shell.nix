@@ -10,9 +10,9 @@ pkgs.mkShell {
     pkgs.rustc
     pkgs.rustfmt
     pkgs.clippy
-    pkgs.pkg-config
   ];
 
+  # fuse3 provides fusermount3, needed at runtime by the pure-rust mount backend
   buildInputs = [
     pkgs.fuse3
   ];

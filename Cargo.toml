@@ -9,7 +9,7 @@ pedantic = { level = "warn", priority = -1 }
 
 
 [dependencies]
-fuser = "0.15.1"
+fuser = { version = "0.15.1", default-features = false }
 libc = "0.2.174"
 
 [[bin]]

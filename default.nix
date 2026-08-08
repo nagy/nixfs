@@ -2,7 +2,6 @@
   pkgs ? import <nixpkgs> { },
   lib ? pkgs.lib,
   rustPlatform ? pkgs.rustPlatform,
-  pkg-config ? pkgs.pkg-config,
   fuse3 ? pkgs.fuse3,
 }:
 
@@ -18,11 +17,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
     lockFile = ./Cargo.lock;
   };
 
-  nativeBuildInputs = [
-    pkg-config
-  ];
-
-  buildInputs = [
+  # fuser uses the pure-rust mount backend (no libfuse), so nothing is
+  # linked at build time; fusermount3 from fuse3 is spawned at runtime
+  # and must be in PATH, hence propagation.
+  propagatedBuildInputs = [
     fuse3
   ];
 
