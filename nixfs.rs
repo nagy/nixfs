@@ -2,7 +2,7 @@ use fuser::{
     FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
 };
 use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ETIMEDOUT};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -10,6 +10,8 @@ const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
 /// How long cached directory listings and resolved store paths remain valid.
 const CACHE_TTL: Duration = Duration::from_mins(5); // 5 minutes
+/// Upper bound on cached entries; the oldest are evicted (FIFO) beyond this.
+const MAX_ENTRIES: usize = 10_000;
 
 fn make_attr(inode: u64, kind: FileType) -> FileAttr {
     let (perm, nlink) = match kind {
@@ -59,6 +61,8 @@ enum EntryKind {
 
 struct NixFS {
     entries: HashMap<u64, EntryKind>,
+    /// Insertion order of `entries` (back = newest), for FIFO eviction.
+    order: VecDeque<u64>,
     /// Nixpkgs expression to resolve attributes from (--nixpkgs, default <nixpkgs>).
     nixpkgs: String,
 }
@@ -67,8 +71,28 @@ impl NixFS {
     fn new(nixpkgs: String) -> Self {
         Self {
             entries: HashMap::new(),
+            order: VecDeque::new(),
             nixpkgs,
         }
+    }
+
+    /// Insert a new entry, evicting the oldest entries beyond `MAX_ENTRIES`.
+    /// Callers must only insert inodes not already in `entries`.
+    fn insert_entry(&mut self, inode: u64, entry: EntryKind) {
+        self.entries.insert(inode, entry);
+        self.order.push_back(inode);
+        while self.entries.len() > MAX_ENTRIES {
+            let Some(evict) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evict);
+        }
+    }
+
+    /// Remove an entry from the cache and the eviction order.
+    fn remove_entry(&mut self, inode: u64) {
+        self.entries.remove(&inode);
+        self.order.retain(|&i| i != inode);
     }
 }
 
@@ -308,7 +332,7 @@ impl fuser::Filesystem for NixFS {
                 EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
                 EntryKind::Dir { .. } => make_attr(inode, FileType::Directory),
             };
-            reply.entry(&Duration::MAX, &attr, 0);
+            reply.entry(&CACHE_TTL, &attr, 0);
             return;
         }
 
@@ -316,8 +340,8 @@ impl fuser::Filesystem for NixFS {
             Ok(AttrKind::Derivation) => {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
-                reply.entry(&Duration::MAX, &make_attr(inode, FileType::Symlink), 0);
-                self.entries.insert(
+                reply.entry(&CACHE_TTL, &make_attr(inode, FileType::Symlink), 0);
+                self.insert_entry(
                     inode,
                     EntryKind::Symlink {
                         attr_path: child_path,
@@ -329,8 +353,8 @@ impl fuser::Filesystem for NixFS {
                 );
             }
             Ok(AttrKind::Directory) => {
-                reply.entry(&Duration::MAX, &make_attr(inode, FileType::Directory), 0);
-                self.entries.insert(
+                reply.entry(&CACHE_TTL, &make_attr(inode, FileType::Directory), 0);
+                self.insert_entry(
                     inode,
                     EntryKind::Dir {
                         attr_path: child_path,
@@ -346,7 +370,7 @@ impl fuser::Filesystem for NixFS {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == 1 {
-            reply.attr(&Duration::MAX, &make_attr(1, FileType::Directory));
+            reply.attr(&CACHE_TTL, &make_attr(1, FileType::Directory));
             return;
         }
         if let Some(entry) = self.entries.get(&ino) {
@@ -354,7 +378,7 @@ impl fuser::Filesystem for NixFS {
                 EntryKind::Symlink { .. } => make_attr(ino, FileType::Symlink),
                 EntryKind::Dir { .. } => make_attr(ino, FileType::Directory),
             };
-            reply.attr(&Duration::MAX, &attr);
+            reply.attr(&CACHE_TTL, &attr);
             return;
         }
         reply.error(ENOENT);
@@ -455,7 +479,7 @@ impl fuser::Filesystem for NixFS {
     }
 
     fn forget(&mut self, _req: &Request, ino: u64, _nlookup: u64) {
-        self.entries.remove(&ino);
+        self.remove_entry(ino);
     }
 
     fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, _size: u32, reply: ReplyXattr) {
@@ -757,5 +781,30 @@ mod tests {
         assert!(parse_args(&["/mnt".to_string(), "/extra".to_string()]).is_err());
         assert!(parse_args(&["--nixpkgs".to_string()]).is_err());
         assert!(parse_args(&["--nixpkgs=".to_string()]).is_err());
+    }
+
+    #[test]
+    fn insert_entry_evicts_oldest_beyond_cap() {
+        let mut fs = NixFS::new(NIXPKGS.to_string());
+        let total = MAX_ENTRIES + 50;
+        for i in 0..total {
+            fs.insert_entry(
+                i as u64,
+                EntryKind::Dir {
+                    attr_path: format!("attr{i}"),
+                },
+            );
+        }
+        assert_eq!(fs.entries.len(), MAX_ENTRIES, "map must stay at the cap");
+        assert_eq!(fs.order.len(), MAX_ENTRIES, "order must mirror the map");
+        // Oldest 50 evicted, newest present.
+        assert!(!fs.entries.contains_key(&0));
+        assert!(!fs.entries.contains_key(&49));
+        assert!(fs.entries.contains_key(&(MAX_ENTRIES as u64 + 49)));
+        // remove_entry (what forget calls) drops it from both structures.
+        let inode = MAX_ENTRIES as u64 + 49;
+        fs.remove_entry(inode);
+        assert!(!fs.entries.contains_key(&inode));
+        assert!(!fs.order.contains(&inode));
     }
 }
