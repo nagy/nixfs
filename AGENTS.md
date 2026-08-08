@@ -68,11 +68,15 @@ ls -l /tmp/nixfs/vim                   # test lookup + readlink
 fusermount -u /tmp/nixfs               # unmount
 ```
 
+CLI: `nixfs [OPTIONS] [MOUNTPOINT]` — options: `--nixpkgs EXPR` (default `<nixpkgs>`), `-h/--help`, `--version` (prints the crate version). Unknown options / extra args exit 2 with usage; mount failures exit 1 with a `fusermount3 -u` hint. Parsing is hand-rolled in `parse_args` (tested) — switch to clap only if subcommands or `-o` options arrive.
+
 ### Nix build
 
 ```bash
 nix-build --expr 'let pkgs = import <nixpkgs> {}; in pkgs.callPackage ./default.nix {}'
 ```
+
+`versionCheckHook` runs `nixfs --version` during installCheck and requires the package `version` string in its output — keep `default.nix`'s `version` in sync with `Cargo.toml` (both `0.1.0`).
 
 ### NixOS VM test
 

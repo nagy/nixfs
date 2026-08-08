@@ -7,7 +7,9 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "nixfs";
-  version = "0-unstable-2026-07-07";
+  # Keep in sync with Cargo.toml: versionCheckHook greps `nixfs --version`
+  # for this exact string.
+  version = "0.1.0";
 
   strictDeps = true;
 
@@ -23,6 +25,14 @@ rustPlatform.buildRustPackage (finalAttrs: {
   propagatedBuildInputs = [
     fuse3
   ];
+
+  # versionCheckHook runs `nixfs --version` in a clean environment and
+  # requires the package version to appear in its output. The package
+  # version is kept in sync with Cargo.toml for that check to work.
+  nativeInstallCheckInputs = [
+    pkgs.versionCheckHook
+  ];
+  doInstallCheck = true;
 
   passthru.tests = let
     nixos-lib = import (pkgs.path + "/nixos/lib") { inherit (pkgs) lib; };

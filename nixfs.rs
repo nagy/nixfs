@@ -57,9 +57,19 @@ enum EntryKind {
     },
 }
 
-#[derive(Default)]
 struct NixFS {
     entries: HashMap<u64, EntryKind>,
+    /// Nixpkgs expression to resolve attributes from (--nixpkgs, default <nixpkgs>).
+    nixpkgs: String,
+}
+
+impl NixFS {
+    fn new(nixpkgs: String) -> Self {
+        Self {
+            entries: HashMap::new(),
+            nixpkgs,
+        }
+    }
 }
 
 // FNV-1a 64-bit: deterministic across processes and remounts, unlike
@@ -89,14 +99,14 @@ enum AttrKind {
 /// Evaluates the derivation (no build) — fast, but the resulting store path
 /// may not exist yet if the derivation hasn't been built or substituted.
 /// Used in `lookup` for existence checking.
-fn nix_eval_attr(attr_path: &str) -> Result<AttrKind, NixError> {
+fn nix_eval_attr(attr_path: &str, nixpkgs: &str) -> Result<AttrKind, NixError> {
     let expr = format!("{attr_path}.outPath");
-    eprintln!("Evaluating: {expr:?} from {NIXPKGS:?}");
+    eprintln!("Evaluating: {expr:?} from {nixpkgs:?}");
     let output = std::process::Command::new(NIX_EXECUTABLE)
         .arg("eval")
         .arg("--raw")
         .arg("-f")
-        .arg(NIXPKGS)
+        .arg(nixpkgs)
         .arg(&expr)
         .output()
         .map_err(|e| {
@@ -154,17 +164,17 @@ fn nix_build(extra_args: &[&str]) -> Result<String, NixError> {
 /// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
 /// build (or substitute) the derivation. Returns the store path on success,
 /// or an errno on failure. Used in `readlink` so the symlink target exists.
-fn nix_build_attr(attr_path: &str) -> Result<String, NixError> {
-    eprintln!("Building: {attr_path:?} from {NIXPKGS:?}");
-    nix_build(&["--attr", attr_path, NIXPKGS])
+fn nix_build_attr(attr_path: &str, nixpkgs: &str) -> Result<String, NixError> {
+    eprintln!("Building: {attr_path:?} from {nixpkgs:?}");
+    nix_build(&["--attr", attr_path, nixpkgs])
 }
 
 /// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>; }'`.
 /// Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
 /// Returns the store path to the unpacked source directory.
-fn nix_build_src_only(attr_path: &str) -> Result<String, NixError> {
+fn nix_build_src_only(attr_path: &str, nixpkgs: &str) -> Result<String, NixError> {
     let expr = format!(
-        "with import <nixpkgs> {{}}; srcOnly {{ name = {attr_path}.name; src = {attr_path}; }}"
+        "with import {nixpkgs} {{}}; srcOnly {{ name = {attr_path}.name; src = {attr_path}; }}"
     );
     eprintln!("Building srcOnly: {attr_path:?}");
     nix_build(&["--expr", &expr])
@@ -302,7 +312,7 @@ impl fuser::Filesystem for NixFS {
             return;
         }
 
-        match nix_eval_attr(&child_path) {
+        match nix_eval_attr(&child_path, &self.nixpkgs) {
             Ok(AttrKind::Derivation) => {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
@@ -366,9 +376,9 @@ impl fuser::Filesystem for NixFS {
                         (out_path.is_none() && error.is_none()) || created.elapsed() > CACHE_TTL;
                     if need_resolve {
                         let result = if *src_only {
-                            nix_build_src_only(attr_path)
+                            nix_build_src_only(attr_path, &self.nixpkgs)
                         } else {
-                            nix_build_attr(attr_path)
+                            nix_build_attr(attr_path, &self.nixpkgs)
                         };
                         match result {
                             Ok(path) => {
@@ -483,25 +493,114 @@ impl fuser::Filesystem for NixFS {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+/// Parsed command line.
+#[derive(Debug, PartialEq)]
+struct Cli {
+    mount_path: String,
+    nixpkgs: String,
+    action: CliAction,
+}
 
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        eprintln!(
-            "Usage: {} [mountpoint]\n\
-             \n\
-             Mount Nix package attributes as a FUSE filesystem.\n\
-             \n\
-             If no mountpoint is given, defaults to /nixfs.\n",
-            args.first().map_or("nixfs", String::as_str)
-        );
-        std::process::exit(0);
+/// What the process should do, derived from the parsed command line.
+#[derive(Debug, PartialEq)]
+enum CliAction {
+    Mount,
+    Help,
+    Version,
+}
+
+/// Parse command-line arguments (argv[1..]). Usage errors are returned as a
+/// message; the caller prints usage and exits 2.
+fn parse_args(args: &[String]) -> Result<Cli, String> {
+    let mut mount_path = None;
+    let mut nixpkgs = NIXPKGS.to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                return Ok(Cli {
+                    mount_path: "/nixfs".to_string(),
+                    nixpkgs,
+                    action: CliAction::Help,
+                });
+            }
+            "--version" => {
+                return Ok(Cli {
+                    mount_path: "/nixfs".to_string(),
+                    nixpkgs,
+                    action: CliAction::Version,
+                });
+            }
+            "--nixpkgs" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return Err("option '--nixpkgs' requires an argument".to_string());
+                };
+                nixpkgs.clone_from(value);
+            }
+            _ => {
+                if let Some(value) = args[i].strip_prefix("--nixpkgs=") {
+                    if value.is_empty() {
+                        return Err("option '--nixpkgs' requires an argument".to_string());
+                    }
+                    nixpkgs = value.to_string();
+                } else if args[i].starts_with('-') && args[i].len() > 1 {
+                    return Err(format!("unknown option '{}'", args[i]));
+                } else if mount_path.is_some() {
+                    return Err(format!("unexpected extra argument '{}'", args[i]));
+                } else {
+                    mount_path = Some(args[i].clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(Cli {
+        mount_path: mount_path.unwrap_or_else(|| "/nixfs".to_string()),
+        nixpkgs,
+        action: CliAction::Mount,
+    })
+}
+
+fn print_usage(program: &str) {
+    eprintln!(
+        "Usage: {program} [OPTIONS] [MOUNTPOINT]\n\n\
+         Mount Nix package attributes as a FUSE filesystem.\n\n\
+         Options:\n  --nixpkgs EXPR   resolve attributes from EXPR (default: <nixpkgs>)\n  \
+         -h, --help       show this help and exit\n  --version        print version and exit\n\n\
+         If no mountpoint is given, defaults to /nixfs.\n"
+    );
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let program = std::env::args()
+        .next()
+        .unwrap_or_else(|| "nixfs".to_string());
+
+    let cli = match parse_args(&args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("{program}: {err}");
+            print_usage(&program);
+            std::process::exit(2);
+        }
+    };
+    match cli.action {
+        CliAction::Help => {
+            print_usage(&program);
+            std::process::exit(0);
+        }
+        CliAction::Version => {
+            println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        CliAction::Mount => {}
     }
 
-    let mount_path = args.get(1).map_or("/nixfs", String::as_str);
     if let Err(e) = fuser::mount2(
-        NixFS::default(),
-        mount_path,
+        NixFS::new(cli.nixpkgs),
+        &cli.mount_path,
         &[
             MountOption::RO,
             MountOption::FSName("nixfs".to_string()),
@@ -509,7 +608,11 @@ fn main() {
             MountOption::AllowRoot,
         ],
     ) {
-        eprintln!("Failed to mount {mount_path}: {e}");
+        eprintln!("Failed to mount {}: {e}", cli.mount_path);
+        eprintln!(
+            "Hint: make sure {} exists and is not already mounted (try `fusermount3 -u {}`).",
+            cli.mount_path, cli.mount_path
+        );
         std::process::exit(1);
     }
 }
@@ -600,5 +703,59 @@ mod tests {
         assert_ne!(inode_for_attr_path(""), 0);
         // Non-empty real paths also must not collide with root (inode 1 is root)
         assert_ne!(inode_for_attr_path("vim"), 1);
+    }
+
+    #[test]
+    fn parse_args_defaults_to_nixfs_and_nixpkgs() {
+        let cli = parse_args(&[]).unwrap();
+        assert_eq!(cli.action, CliAction::Mount);
+        assert_eq!(cli.mount_path, "/nixfs");
+        assert_eq!(cli.nixpkgs, NIXPKGS);
+    }
+
+    #[test]
+    fn parse_args_accepts_mountpoint_and_nixpkgs() {
+        let cli = parse_args(&[
+            "/tmp/mnt".to_string(),
+            "--nixpkgs".to_string(),
+            "/custom".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(cli.mount_path, "/tmp/mnt");
+        assert_eq!(cli.nixpkgs, "/custom");
+
+        let cli = parse_args(&["--nixpkgs=/custom".to_string()]).unwrap();
+        assert_eq!(cli.nixpkgs, "/custom");
+
+        let cli = parse_args(&["--nixpkgs=/custom".to_string(), "/tmp/mnt".to_string()]).unwrap();
+        assert_eq!(cli.mount_path, "/tmp/mnt");
+        assert_eq!(cli.nixpkgs, "/custom");
+    }
+
+    #[test]
+    fn parse_args_handles_help_and_version() {
+        assert_eq!(
+            parse_args(&["--version".to_string()]).unwrap().action,
+            CliAction::Version
+        );
+        assert_eq!(
+            parse_args(&["-h".to_string()]).unwrap().action,
+            CliAction::Help
+        );
+        assert_eq!(
+            parse_args(&["/mnt".to_string(), "--help".to_string()])
+                .unwrap()
+                .action,
+            CliAction::Help
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_and_extra_args() {
+        assert!(parse_args(&["--bogus".to_string()]).is_err());
+        assert!(parse_args(&["-x".to_string()]).is_err());
+        assert!(parse_args(&["/mnt".to_string(), "/extra".to_string()]).is_err());
+        assert!(parse_args(&["--nixpkgs".to_string()]).is_err());
+        assert!(parse_args(&["--nixpkgs=".to_string()]).is_err());
     }
 }
