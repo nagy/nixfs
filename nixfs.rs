@@ -1,7 +1,7 @@
 use fuser::{
     FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
 };
-use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ETIMEDOUT};
+use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ERANGE, ETIMEDOUT};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -269,6 +269,37 @@ fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
     }
 }
 
+/// How to answer an xattr request for a payload of `len` bytes against the
+/// kernel's `size` probe, per the FUSE xattr protocol.
+#[derive(Debug, PartialEq)]
+enum XattrReply {
+    /// size == 0: reply the total length so the caller can allocate.
+    Size,
+    /// The payload fits: send it.
+    Data,
+    /// The payload does not fit: reply ERANGE.
+    Range,
+}
+
+fn xattr_outcome(size: u32, len: usize) -> XattrReply {
+    if size == 0 {
+        XattrReply::Size
+    } else if len > size as usize {
+        XattrReply::Range
+    } else {
+        XattrReply::Data
+    }
+}
+
+/// Reply with `data` honoring the kernel's xattr size protocol.
+fn reply_xattr(size: u32, data: &[u8], reply: ReplyXattr) {
+    match xattr_outcome(size, data.len()) {
+        XattrReply::Size => reply.size(u32::try_from(data.len()).unwrap_or(u32::MAX)),
+        XattrReply::Data => reply.data(data),
+        XattrReply::Range => reply.error(ERANGE),
+    }
+}
+
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // Reject non-UTF-8 names — Nix attr names are always valid UTF-8.
@@ -482,7 +513,7 @@ impl fuser::Filesystem for NixFS {
         self.remove_entry(ino);
     }
 
-    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, _size: u32, reply: ReplyXattr) {
+    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
         let Some(name_str) = name.to_str() else {
             reply.error(ENODATA);
             return;
@@ -501,19 +532,16 @@ impl fuser::Filesystem for NixFS {
             reply.error(ENODATA);
             return;
         };
-        reply.data(msg.as_bytes());
+        reply_xattr(size, msg.as_bytes(), reply);
     }
 
-    fn listxattr(&mut self, _req: &Request, ino: u64, _size: u32, reply: ReplyXattr) {
+    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
         let has_error = matches!(
             self.entries.get(&ino),
             Some(EntryKind::Symlink { error: Some(_), .. })
         );
-        if has_error {
-            reply.data(b"user.error\0");
-        } else {
-            reply.data(b"");
-        }
+        let data: &[u8] = if has_error { b"user.error\0" } else { b"" };
+        reply_xattr(size, data, reply);
     }
 }
 
@@ -781,6 +809,15 @@ mod tests {
         assert!(parse_args(&["/mnt".to_string(), "/extra".to_string()]).is_err());
         assert!(parse_args(&["--nixpkgs".to_string()]).is_err());
         assert!(parse_args(&["--nixpkgs=".to_string()]).is_err());
+    }
+
+    #[test]
+    fn xattr_outcome_implements_size_protocol() {
+        assert_eq!(xattr_outcome(0, 123), XattrReply::Size);
+        assert_eq!(xattr_outcome(0, 0), XattrReply::Size);
+        assert_eq!(xattr_outcome(123, 123), XattrReply::Data);
+        assert_eq!(xattr_outcome(1, 0), XattrReply::Data);
+        assert_eq!(xattr_outcome(100, 123), XattrReply::Range);
     }
 
     #[test]
