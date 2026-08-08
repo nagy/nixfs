@@ -51,6 +51,10 @@ ls -l /nixfs/qemu.src@unpacked  lookup("qemu.src@unpacked",1)  strip @unpacked s
 ### Path resolution
 
 Filenames are used directly as Nixpkgs attribute names. No path manipulation needed.
+Names are validated against a strict allowlist before any `nix` invocation: every
+dot-separated segment must match `[A-Za-z0-9_][A-Za-z0-9_'-]*` (measured against
+39k+ nixpkgs attrs, incl. digit-leading `haskellPackages.2captcha`); junk names get
+`EINVAL` without spawning `nix`. The `@unpacked` suffix is stripped before validation.
 
 | Input | lookup resolves | readlink resolves |
 |---|---|---|

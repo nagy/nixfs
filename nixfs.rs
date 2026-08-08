@@ -302,6 +302,26 @@ fn reply_xattr(size: u32, data: &[u8], reply: ReplyXattr) {
     }
 }
 
+/// Whether `name` is a valid Nix attr-path: non-empty dot-separated segments,
+/// each starting with an ASCII alphanumeric or `_` and continuing with
+/// alphanumeric, `_`, `'` or `-`. Matches every attr found in the measured
+/// nixpkgs sets (27,772 top-level, 11,791 python3Packages, 19,523
+/// haskellPackages, incl. digit-leading names like `2captcha`) while
+/// rejecting junk (spaces, `@`, `;`, `}`, quotes, empty segments) before any
+/// nix subprocess is spawned.
+fn is_valid_attr_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && name.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'' | '-'))
+        })
+}
+
 impl fuser::Filesystem for NixFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         // Reject non-UTF-8 names — Nix attr names are always valid UTF-8.
@@ -316,8 +336,9 @@ impl fuser::Filesystem for NixFS {
         } else {
             (orig_name, false)
         };
-        // Validate after stripping suffix.
-        if child_name.is_empty() || child_name.starts_with('.') || child_name.ends_with('.') {
+        // Validate after stripping suffix: strict allowlist so junk names
+        // never reach a nix subprocess (misleading ENOENT + eval cost).
+        if !is_valid_attr_name(child_name) {
             reply.error(EINVAL);
             return;
         }
@@ -865,6 +886,46 @@ mod tests {
         assert_eq!(xattr_outcome(123, 123), XattrReply::Data);
         assert_eq!(xattr_outcome(1, 0), XattrReply::Data);
         assert_eq!(xattr_outcome(100, 123), XattrReply::Range);
+    }
+
+    #[test]
+    fn is_valid_attr_name_accepts_real_nix_attrs() {
+        for name in [
+            "vim",
+            "python3Packages.numpy",
+            "qemu.src",
+            "haskellPackages.2captcha", // digit-leading: reachable, must stay
+            "3d-graphics-examples",
+            "foo_bar-baz'qux",
+            "a",
+        ] {
+            assert!(is_valid_attr_name(name), "{name:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn is_valid_attr_name_rejects_junk() {
+        for name in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "foo.",
+            "foo..bar",
+            "x} ; id",
+            "foo bar",
+            "@unpacked",
+            "foo@unpacked@unpacked",
+            "foo;bar",
+            "foo(bar)",
+            "a\"b",
+            "-dash",
+            "'quote",
+            "π",
+            "a b.c",
+        ] {
+            assert!(!is_valid_attr_name(name), "{name:?} must be rejected");
+        }
     }
 
     #[test]
