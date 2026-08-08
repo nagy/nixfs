@@ -127,6 +127,8 @@ fn nix_eval_attr(attr_path: &str, nixpkgs: &str) -> Result<AttrKind, NixError> {
     let expr = format!("{attr_path}.outPath");
     eprintln!("Evaluating: {expr:?} from {nixpkgs:?}");
     let output = std::process::Command::new(NIX_EXECUTABLE)
+        .arg("--extra-experimental-features")
+        .arg("nix-command")
         .arg("eval")
         .arg("--raw")
         .arg("-f")
@@ -394,7 +396,10 @@ impl fuser::Filesystem for NixFS {
             }
             Err(e) => {
                 reply.error(e.errno);
-                // (message is available via the user.error xattr)
+                // No entry is inserted on failure, so the message cannot be
+                // surfaced via the user.error xattr: the path does not exist,
+                // so getfattr never reaches getxattr. It is only in the
+                // daemon log above (nix_eval_attr eprintln).
             }
         }
     }
@@ -614,6 +619,43 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     })
 }
 
+/// Verify runtime prerequisites before mounting: `nix` and `nix-build` must
+/// be runnable, and `nix eval` must work against the configured nixpkgs.
+/// This also proves the `nix-command` experimental feature, which nixfs
+/// requests explicitly via `--extra-experimental-features`.
+fn preflight(nixpkgs: &str) -> Result<(), String> {
+    for tool in [NIX_EXECUTABLE, "nix-build"] {
+        let output = std::process::Command::new(tool)
+            .arg("--version")
+            .output()
+            .map_err(|e| format!("{tool} not runnable: {e} (is it on PATH?)"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{tool} --version failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    let output = std::process::Command::new(NIX_EXECUTABLE)
+        .arg("--extra-experimental-features")
+        .arg("nix-command")
+        .arg("eval")
+        .arg("--raw")
+        .arg("-f")
+        .arg(nixpkgs)
+        .arg("system")
+        .output()
+        .map_err(|e| format!("{NIX_EXECUTABLE} not runnable: {e} (is it on PATH?)"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "nix eval against {nixpkgs} failed: {stderr}\n\
+             Hint: check NIX_PATH (or pass --nixpkgs) and that the nix-command feature is available."
+        ));
+    }
+    Ok(())
+}
+
 fn print_usage(program: &str) {
     eprintln!(
         "Usage: {program} [OPTIONS] [MOUNTPOINT]\n\n\
@@ -647,7 +689,12 @@ fn main() {
             println!("{program} {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
-        CliAction::Mount => {}
+        CliAction::Mount => {
+            if let Err(err) = preflight(&cli.nixpkgs) {
+                eprintln!("{program}: preflight failed: {err}");
+                std::process::exit(1);
+            }
+        }
     }
 
     if let Err(e) = fuser::mount2(

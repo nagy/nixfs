@@ -10,7 +10,7 @@ pointing to the Nix store path of `<nixpkgs>.vim`.
 
 - Nix tooling required at runtime: `nix`, `nix-build`
 - `fusermount3` (from `fuse3`) required at runtime for mounting — fuser uses the pure-rust mount backend (no libfuse; `default-features = false` in Cargo.toml)
-- `nix eval` needs `nix-command` experimental feature enabled (e.g. `experimental-features = nix-command` in `nix.conf`)
+- `nixfs` passes `--extra-experimental-features nix-command` to `nix eval` itself and runs a mount-time preflight (`nix`/`nix-build` on PATH, `nix eval` working against the configured nixpkgs) — no user `nix.conf` configuration needed
 - See `Cargo.toml` for Rust edition, dependencies, and binary layout.
 
 ## Architecture
