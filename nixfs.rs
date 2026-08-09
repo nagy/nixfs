@@ -206,14 +206,34 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Hash an attribute path to a deterministic 64-bit inode.
-fn inode_for_attr_path(attr_path: &str) -> u64 {
+const fn inode_for_attr_path(attr_path: &str) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in attr_path.as_bytes() {
-        hash ^= u64::from(*byte);
+    let bytes = attr_path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Note: `as u64`, not `u64::from` — From is not yet const-stable.
+        hash ^= bytes[i] as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
     }
     hash
 }
+
+// Compile-time invariants of the inode scheme (mirror of the runtime tests):
+// inode 0 is reserved in FUSE, inode 1 is the root, and the @unpacked
+// suffix must change the inode. A violation fails the build.
+const _: () = assert!(
+    inode_for_attr_path("") != 0,
+    "empty path must not hash to inode 0"
+);
+const _: () = assert!(
+    inode_for_attr_path("vim") != 1,
+    "paths must not collide with root"
+);
+const _: () = assert!(
+    inode_for_attr_path("qemu.src") != inode_for_attr_path("qemu.src@unpacked"),
+    "@unpacked suffix must change the inode"
+);
 
 /// What kind of Nix attribute exists at a given dotted path.
 enum AttrKind {
