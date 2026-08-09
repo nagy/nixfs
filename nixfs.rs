@@ -2,8 +2,10 @@ use fuser::{
     FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
 };
 use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ERANGE, ETIMEDOUT};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const NIX_EXECUTABLE: &str = "nix";
@@ -59,23 +61,48 @@ enum EntryKind {
     },
 }
 
-struct NixFS {
+/// Shared cache: entries, FIFO eviction order, and in-flight resolution
+/// slots. Everything is behind one mutex; blocking nix subprocesses must
+/// never run while it is held.
+struct Cache {
     entries: HashMap<u64, EntryKind>,
     /// Insertion order of `entries` (back = newest), for FIFO eviction.
     order: VecDeque<u64>,
+    /// In-flight symlink resolutions: inode -> completion slot. The builder
+    /// fills the slot, waiters block on the condvar instead of rebuilding.
+    inflight: HashMap<u64, Arc<Slot>>,
+}
+
+/// Completion slot for one in-flight resolution: the result once known.
+type Slot = (Mutex<Option<BuildResult>>, Condvar);
+
+/// Outcome of resolving a symlink target.
+type BuildResult = Result<String, NixError>;
+
+struct NixFS {
+    cache: Arc<Mutex<Cache>>,
     /// Nixpkgs expression to resolve attributes from (--nixpkgs, default <nixpkgs>).
     nixpkgs: String,
+}
+
+fn lock_cache(cache: &Arc<Mutex<Cache>>) -> MutexGuard<'_, Cache> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl NixFS {
     fn new(nixpkgs: String) -> Self {
         Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            cache: Arc::new(Mutex::new(Cache {
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+                inflight: HashMap::new(),
+            })),
             nixpkgs,
         }
     }
+}
 
+impl Cache {
     /// Insert a new entry, evicting the oldest entries beyond `MAX_ENTRIES`.
     /// Callers must only insert inodes not already in `entries`.
     fn insert_entry(&mut self, inode: u64, entry: EntryKind) {
@@ -94,6 +121,83 @@ impl NixFS {
         self.entries.remove(&inode);
         self.order.retain(|&i| i != inode);
     }
+}
+
+/// Resolve a symlink entry, deduplicating concurrent resolutions of the same
+/// inode. Runs on a worker thread off the FUSE request loop; the caller's
+/// `build` closure must not touch the cache.
+fn resolve_symlink<F>(cache: &Arc<Mutex<Cache>>, inode: u64, build: F) -> BuildResult
+where
+    F: FnOnce(bool, &str) -> BuildResult + Send,
+{
+    // Snapshot what the builder needs and join-or-create the completion slot.
+    let (attr_path, src_only) = {
+        let cache = lock_cache(cache);
+        let Some(EntryKind::Symlink {
+            attr_path,
+            src_only,
+            ..
+        }) = cache.entries.get(&inode)
+        else {
+            return Err(NixError {
+                errno: ENOENT,
+                message: "entry evicted while resolving".to_string(),
+            });
+        };
+        (attr_path.clone(), *src_only)
+    };
+    let (slot, is_builder) = {
+        let mut cache = lock_cache(cache);
+        match cache.inflight.entry(inode) {
+            Entry::Vacant(entry) => {
+                let slot = Arc::new((Mutex::new(None), Condvar::new()));
+                entry.insert(slot.clone());
+                (slot, true)
+            }
+            Entry::Occupied(entry) => (entry.get().clone(), false),
+        }
+    };
+
+    let result = if is_builder {
+        let resolved = build(src_only, &attr_path);
+        let (lock, condvar) = &*slot;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
+        condvar.notify_all();
+        resolved
+    } else {
+        let (lock, condvar) = &*slot;
+        let mut guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while guard.is_none() {
+            guard = condvar.wait(guard).unwrap_or_else(PoisonError::into_inner);
+        }
+        guard.as_ref().expect("woken only when filled").clone()
+    };
+
+    // Record the outcome in the cache and drop the slot (builder only).
+    let mut cache = lock_cache(cache);
+    if let Some(EntryKind::Symlink {
+        out_path,
+        created,
+        error,
+        ..
+    }) = cache.entries.get_mut(&inode)
+    {
+        *created = Instant::now();
+        match &result {
+            Ok(path) => {
+                *out_path = Some(path.clone());
+                *error = None;
+            }
+            Err(err) => {
+                *out_path = None;
+                *error = Some((err.errno, err.message.clone()));
+            }
+        }
+    }
+    if is_builder {
+        cache.inflight.remove(&inode);
+    }
+    result
 }
 
 // FNV-1a 64-bit: deterministic across processes and remounts, unlike
@@ -208,7 +312,7 @@ fn nix_build_src_only(attr_path: &str, nixpkgs: &str) -> Result<String, NixError
 
 /// Classified result of a failed `nix eval`/`nix-build` invocation:
 /// the errno to reply to FUSE, plus the actual stderr message.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct NixError {
     errno: i32,
     message: String,
@@ -348,20 +452,23 @@ impl fuser::Filesystem for NixFS {
         );
 
         // Resolve parent attr path for non-root lookups.
-        let parent_attr = if parent == 1 {
-            None
-        } else {
-            let Some(parent_entry) = self.entries.get(&parent) else {
-                reply.error(ENOENT);
-                return;
-            };
-            let parent_path = if let EntryKind::Dir { attr_path, .. } = parent_entry {
-                attr_path.as_str()
+        let parent_attr = {
+            let cache = lock_cache(&self.cache);
+            if parent == 1 {
+                None
             } else {
-                reply.error(ENOTDIR);
-                return;
-            };
-            Some(parent_path.to_string())
+                let Some(parent_entry) = cache.entries.get(&parent) else {
+                    reply.error(ENOENT);
+                    return;
+                };
+                let parent_path = if let EntryKind::Dir { attr_path, .. } = parent_entry {
+                    attr_path.as_str()
+                } else {
+                    reply.error(ENOTDIR);
+                    return;
+                };
+                Some(parent_path.to_string())
+            }
         };
 
         // Build the full dotted attr path (without @suffix) for nix eval/building.
@@ -381,13 +488,16 @@ impl fuser::Filesystem for NixFS {
         let inode = inode_for_attr_path(&full_inode_path);
 
         // If we already have an entry, just reply with it.
-        if let Some(entry) = self.entries.get(&inode) {
-            let attr = match entry {
-                EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
-                EntryKind::Dir { .. } => make_attr(inode, FileType::Directory),
-            };
-            reply.entry(&CACHE_TTL, &attr, 0);
-            return;
+        {
+            let cache = lock_cache(&self.cache);
+            if let Some(entry) = cache.entries.get(&inode) {
+                let attr = match entry {
+                    EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
+                    EntryKind::Dir { .. } => make_attr(inode, FileType::Directory),
+                };
+                reply.entry(&CACHE_TTL, &attr, 0);
+                return;
+            }
         }
 
         match nix_eval_attr(&child_path, &self.nixpkgs) {
@@ -395,7 +505,7 @@ impl fuser::Filesystem for NixFS {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
                 reply.entry(&CACHE_TTL, &make_attr(inode, FileType::Symlink), 0);
-                self.insert_entry(
+                lock_cache(&self.cache).insert_entry(
                     inode,
                     EntryKind::Symlink {
                         attr_path: child_path,
@@ -408,7 +518,7 @@ impl fuser::Filesystem for NixFS {
             }
             Ok(AttrKind::Directory) => {
                 reply.entry(&CACHE_TTL, &make_attr(inode, FileType::Directory), 0);
-                self.insert_entry(
+                lock_cache(&self.cache).insert_entry(
                     inode,
                     EntryKind::Dir {
                         attr_path: child_path,
@@ -430,7 +540,8 @@ impl fuser::Filesystem for NixFS {
             reply.attr(&CACHE_TTL, &make_attr(1, FileType::Directory));
             return;
         }
-        if let Some(entry) = self.entries.get(&ino) {
+        let cache = lock_cache(&self.cache);
+        if let Some(entry) = cache.entries.get(&ino) {
             let attr = match entry {
                 EntryKind::Symlink { .. } => make_attr(ino, FileType::Symlink),
                 EntryKind::Dir { .. } => make_attr(ino, FileType::Directory),
@@ -442,54 +553,64 @@ impl fuser::Filesystem for NixFS {
     }
 
     fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
-        if let Some(entry) = self.entries.get_mut(&inode) {
-            match entry {
-                EntryKind::Symlink {
-                    attr_path,
+        let cache = self.cache.clone();
+        let nixpkgs = self.nixpkgs.clone();
+
+        // Fast path: resolved (or failed) recently — reply from the cache
+        // without spawning a thread.
+        {
+            let cache = lock_cache(&cache);
+            match cache.entries.get(&inode) {
+                None => {
+                    reply.error(ENOENT);
+                    return;
+                }
+                Some(EntryKind::Dir { .. }) => {
+                    reply.error(EINVAL);
+                    return;
+                }
+                Some(EntryKind::Symlink {
                     out_path,
                     created,
-                    src_only,
                     error,
-                } => {
-                    // Resolve if untried (no out_path yet, no error recorded)
-                    // or the last attempt is stale.
-                    let need_resolve =
-                        (out_path.is_none() && error.is_none()) || created.elapsed() > CACHE_TTL;
-                    if need_resolve {
-                        let result = if *src_only {
-                            nix_build_src_only(attr_path, &self.nixpkgs)
-                        } else {
-                            nix_build_attr(attr_path, &self.nixpkgs)
-                        };
-                        match result {
-                            Ok(path) => {
-                                *created = Instant::now();
-                                *out_path = Some(path);
-                                *error = None;
-                            }
-                            Err(e) => {
-                                *created = Instant::now();
-                                *error = Some((e.errno, e.message));
-                            }
+                    ..
+                }) => {
+                    let fresh =
+                        (out_path.is_some() || error.is_some()) && created.elapsed() <= CACHE_TTL;
+                    if fresh {
+                        // Build failed — surface the real errno instead of a
+                        // blanket EIO (message via the user.error xattr).
+                        if let Some(path) = out_path {
+                            reply.data(path.as_bytes());
+                            return;
                         }
+                        if let Some((errno, _)) = error {
+                            reply.error(*errno);
+                            return;
+                        }
+                        reply.error(EIO);
+                        return;
                     }
-                    match out_path {
-                        Some(path) => reply.data(path.as_bytes()),
-                        // Build failed — surface the real errno instead of a blanket
-                        // EIO (the message is available via the user.error xattr).
-                        None => match error {
-                            Some((errno, _)) => reply.error(*errno),
-                            None => reply.error(EIO),
-                        },
-                    }
-                }
-                EntryKind::Dir { .. } => {
-                    reply.error(EINVAL);
                 }
             }
-            return;
         }
-        reply.error(ENOENT);
+
+        // Slow path: resolve off the request loop so a multi-minute build
+        // never stalls other operations. Deduplication happens inside
+        // resolve_symlink (in-flight slot per inode).
+        std::thread::spawn(move || {
+            let result = resolve_symlink(&cache, inode, |src_only, attr_path| {
+                if src_only {
+                    nix_build_src_only(attr_path, &nixpkgs)
+                } else {
+                    nix_build_attr(attr_path, &nixpkgs)
+                }
+            });
+            match result {
+                Ok(path) => reply.data(path.as_bytes()),
+                Err(err) => reply.error(err.errno),
+            }
+        });
     }
 
     fn readdir(
@@ -503,19 +624,22 @@ impl fuser::Filesystem for NixFS {
         // Directories are always empty — Nix attribute discovery is not
         // provided via readdir.  Packages are resolved only through explicit
         // lookup + readlink (e.g.  ls -l /nixfs/vim).
-        let parent_inode = if ino == 1 {
-            1
-        } else if let Some(EntryKind::Dir { attr_path }) = self.entries.get(&ino) {
-            attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
-                if parent_path.is_empty() {
-                    1
-                } else {
-                    inode_for_attr_path(parent_path)
-                }
-            })
-        } else {
-            reply.error(ENOTDIR);
-            return;
+        let parent_inode = {
+            let cache = lock_cache(&self.cache);
+            if ino == 1 {
+                1
+            } else if let Some(EntryKind::Dir { attr_path }) = cache.entries.get(&ino) {
+                attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
+                    if parent_path.is_empty() {
+                        1
+                    } else {
+                        inode_for_attr_path(parent_path)
+                    }
+                })
+            } else {
+                reply.error(ENOTDIR);
+                return;
+            }
         };
 
         let entries = [
@@ -536,7 +660,7 @@ impl fuser::Filesystem for NixFS {
     }
 
     fn forget(&mut self, _req: &Request, ino: u64, _nlookup: u64) {
-        self.remove_entry(ino);
+        lock_cache(&self.cache).remove_entry(ino);
     }
 
     fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
@@ -548,24 +672,30 @@ impl fuser::Filesystem for NixFS {
             reply.error(ENODATA);
             return;
         }
-        let msg = if let Some(EntryKind::Symlink {
-            error: Some((_, msg)),
-            ..
-        }) = self.entries.get(&ino)
-        {
-            msg.clone()
-        } else {
-            reply.error(ENODATA);
-            return;
+        let msg = {
+            let cache = lock_cache(&self.cache);
+            if let Some(EntryKind::Symlink {
+                error: Some((_, msg)),
+                ..
+            }) = cache.entries.get(&ino)
+            {
+                msg.clone()
+            } else {
+                reply.error(ENODATA);
+                return;
+            }
         };
         reply_xattr(size, msg.as_bytes(), reply);
     }
 
     fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
-        let has_error = matches!(
-            self.entries.get(&ino),
-            Some(EntryKind::Symlink { error: Some(_), .. })
-        );
+        let has_error = {
+            let cache = lock_cache(&self.cache);
+            matches!(
+                cache.entries.get(&ino),
+                Some(EntryKind::Symlink { error: Some(_), .. })
+            )
+        };
         let data: &[u8] = if has_error { b"user.error\0" } else { b"" };
         reply_xattr(size, data, reply);
     }
@@ -930,26 +1060,133 @@ mod tests {
 
     #[test]
     fn insert_entry_evicts_oldest_beyond_cap() {
-        let mut fs = NixFS::new(NIXPKGS.to_string());
+        let fs = NixFS::new(NIXPKGS.to_string());
         let total = MAX_ENTRIES + 50;
-        for i in 0..total {
-            fs.insert_entry(
-                i as u64,
-                EntryKind::Dir {
-                    attr_path: format!("attr{i}"),
+        {
+            let mut cache = lock_cache(&fs.cache);
+            for i in 0..total {
+                cache.insert_entry(
+                    i as u64,
+                    EntryKind::Dir {
+                        attr_path: format!("attr{i}"),
+                    },
+                );
+            }
+            assert_eq!(cache.entries.len(), MAX_ENTRIES, "map must stay at the cap");
+            assert_eq!(cache.order.len(), MAX_ENTRIES, "order must mirror the map");
+            // Oldest 50 evicted, newest present.
+            assert!(!cache.entries.contains_key(&0));
+            assert!(!cache.entries.contains_key(&49));
+            assert!(cache.entries.contains_key(&(MAX_ENTRIES as u64 + 49)));
+            // remove_entry (what forget calls) drops it from both structures.
+            let inode = MAX_ENTRIES as u64 + 49;
+            cache.remove_entry(inode);
+            assert!(!cache.entries.contains_key(&inode));
+            assert!(!cache.order.contains(&inode));
+        }
+    }
+
+    #[test]
+    fn resolve_symlink_dedups_concurrent_builds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fs = NixFS::new(NIXPKGS.to_string());
+        {
+            let mut cache = lock_cache(&fs.cache);
+            cache.entries.insert(
+                42,
+                EntryKind::Symlink {
+                    attr_path: "foo".to_string(),
+                    out_path: None,
+                    created: Instant::now().checked_sub(Duration::from_hours(1)).unwrap(), // stale
+                    src_only: false,
+                    error: None,
                 },
             );
         }
-        assert_eq!(fs.entries.len(), MAX_ENTRIES, "map must stay at the cap");
-        assert_eq!(fs.order.len(), MAX_ENTRIES, "order must mirror the map");
-        // Oldest 50 evicted, newest present.
-        assert!(!fs.entries.contains_key(&0));
-        assert!(!fs.entries.contains_key(&49));
-        assert!(fs.entries.contains_key(&(MAX_ENTRIES as u64 + 49)));
-        // remove_entry (what forget calls) drops it from both structures.
-        let inode = MAX_ENTRIES as u64 + 49;
-        fs.remove_entry(inode);
-        assert!(!fs.entries.contains_key(&inode));
-        assert!(!fs.order.contains(&inode));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let cache = fs.cache.clone();
+            let builds = builds.clone();
+            handles.push(std::thread::spawn(move || {
+                let result = resolve_symlink(&cache, 42, |_, _| {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok("/nix/store/foo".to_string())
+                });
+                assert_eq!(result, Ok("/nix/store/foo".to_string()));
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker must not panic");
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "four concurrent readlinks must trigger one build"
+        );
+        let cache = lock_cache(&fs.cache);
+        assert!(
+            matches!(
+                cache.entries.get(&42),
+                Some(EntryKind::Symlink { out_path: Some(path), error: None, .. })
+                    if path == "/nix/store/foo"
+            ),
+            "cache must record the resolved path"
+        );
+        assert!(
+            cache.inflight.is_empty(),
+            "completion slot must be cleaned up"
+        );
+    }
+
+    #[test]
+    fn resolve_symlink_records_failure_and_cleans_slot() {
+        let fs = NixFS::new(NIXPKGS.to_string());
+        {
+            let mut cache = lock_cache(&fs.cache);
+            cache.entries.insert(
+                7,
+                EntryKind::Symlink {
+                    attr_path: "bar".to_string(),
+                    out_path: None,
+                    created: Instant::now().checked_sub(Duration::from_hours(1)).unwrap(),
+                    src_only: false,
+                    error: None,
+                },
+            );
+        }
+        let result = resolve_symlink(&fs.cache, 7, |_, _| {
+            Err(NixError {
+                errno: EIO,
+                message: "build boom".to_string(),
+            })
+        });
+        assert_eq!(
+            result,
+            Err(NixError {
+                errno: EIO,
+                message: "build boom".to_string()
+            })
+        );
+        let cache = lock_cache(&fs.cache);
+        assert!(
+            matches!(
+                cache.entries.get(&7),
+                Some(EntryKind::Symlink { out_path: None, error: Some((EIO, msg)), .. })
+                    if msg == "build boom"
+            ),
+            "failure must be recorded for the user.error xattr"
+        );
+        assert!(cache.inflight.is_empty());
+    }
+
+    #[test]
+    fn resolve_symlink_returns_enoent_for_evicted_entry() {
+        let fs = NixFS::new(NIXPKGS.to_string());
+        let result = resolve_symlink(&fs.cache, 99, |_, _| Ok("/nix/store/x".to_string()));
+        assert_eq!(result.unwrap_err().errno, ENOENT);
+        assert!(lock_cache(&fs.cache).inflight.is_empty());
     }
 }

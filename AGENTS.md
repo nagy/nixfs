@@ -21,22 +21,27 @@ pointing to the Nix store path of `<nixpkgs>.vim`.
 user command              FUSE op            nixfs action
 ──────────────────────────────────────────────────────────────────
 ls -l /nixfs/vim          lookup("vim",1)     nix_eval_attr → insert Entry (Dir or Symlink stub)
-                           readlink(inode)    nix_build_attr → cache store path, reply symlink target
+                           readlink(inode)    worker thread: nix_build_attr → cache store path, reply symlink target
 cat /nixfs/vim/...        (follows link)     Nix daemon builds if needed (outside nixfs)
 ls /nixfs/                readdir(1)         returns only "." and ".." (directories are empty)
 ls /nixfs/python3/        readdir(dir_inode) same — explicit lookup required to see children
 ls -l /nixfs/qemu.src@unpacked  lookup("qemu.src@unpacked",1)  strip @unpacked suffix, nix_eval_attr on base
-                           readlink(inode)    nix_build_src_only → unpack via pkgs.srcOnly
+                           readlink(inode)    worker thread: nix_build_src_only → unpack via pkgs.srcOnly
 ```
 
 ### Key types
 
-- **`NixFS`** — holds `HashMap<u64, Entry>` keyed by inode (hash of full dotted attr path).
+- **`NixFS`** — holds `Arc<Mutex<Cache>>`; `Cache` = `HashMap<u64, Entry>` keyed by inode (hash of full
+  dotted attr path) + FIFO eviction order (`MAX_ENTRIES`) + in-flight resolution slots.
 - **`Entry`** — `Dir { attr_path }` or `Symlink { attr_path, out_path, created, src_only, error }`.
   Symlink `out_path` is `None` for stub entries created by `lookup` (resolved lazily in `readlink`).
   `src_only` is `true` when the filename ends in `@unpacked`, meaning `readlink` resolves via `pkgs.srcOnly` instead of `nix-build --attr`.
   `error` is `None` on success/untried; `Some((errno, msg))` after a failed build (retried after `CACHE_TTL`).
   `readlink` replies `errno` (instead of a generic `EIO`); `getxattr user.error` shows `msg`.
+- **Concurrency:** the FUSE request loop is single-threaded, but `readlink` resolution (`nix-build`, can
+  take minutes) runs on worker threads off the loop — the mount never stalls on a build. Concurrent
+  `readlink`s of the same inode deduplicate via an in-flight slot (`resolve_symlink`); the cache mutex
+  is never held across a subprocess wait.
 - **Inode scheme:** FNV-1a 64-bit hash over the full dotted attr path → stable 64-bit inode (deterministic across processes/remounts, unlike `DefaultHasher`).
 - **Root:** inode 1, always a `Dir`. All lookups target `<nixpkgs>` (hardcoded).
 
@@ -95,8 +100,13 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
 
 - Single file for now; modules planned.
 - `eprintln!` used for debug logging (visible on stderr of the mount process).
-- No async runtime — FUSE ops are synchronous and single-threaded.
-- Unit tests for `classify_eval_error`, `classify_nix_stderr`, and `inode_for_attr_path` live in a `#[cfg(test)] mod tests` at the bottom of `nixfs.rs`; run with `cargo test`.
+- No async runtime. The FUSE request loop is single-threaded; `readlink`'s
+  `nix-build` runs on worker threads off the loop (never hold the cache mutex
+  across a subprocess wait), so builds cannot stall the mount.
+- Unit tests for `classify_eval_error`, `classify_nix_stderr`, `inode_for_attr_path`,
+  `parse_args`, `is_valid_attr_name`, cache eviction, and `resolve_symlink` (incl.
+  concurrent dedup) live in a `#[cfg(test)] mod tests` at the bottom of `nixfs.rs`;
+  run with `cargo test`.
 ## Future investigation
 
 - **Nix daemon protocol instead of subprocesses.** Every `lookup` spawns `nix eval`, every `readlink` spawns `nix-build`. Talking to the Nix daemon socket directly (or using a crate) would eliminate fork/exec overhead and give structured error handling instead of scraping stderr. Investigate `nix-sys` or similar.
