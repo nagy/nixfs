@@ -105,6 +105,7 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
 
 ## Style notes
 
+- `rustfmt.toml` (from rkyv, `max_width = 100`) — the unstable options (`imports_granularity = "Crate"`, `group_imports = "StdExternalCrate"`) need `rustfmt --edition 2024 --config 'imports_granularity=Crate,group_imports=StdExternalCrate'`.
 - Single file (`nixfs.rs`) for now; modules planned.
 - `eprintln!` used for debug logging (stderr of the mount process).
 - No async runtime.

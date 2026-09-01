@@ -1,12 +1,14 @@
+use std::{
+    collections::{HashMap, VecDeque, hash_map::Entry},
+    ffi::OsStr,
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant, UNIX_EPOCH},
+};
+
 use fuser::{
     FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
 };
 use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ERANGE, ETIMEDOUT};
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
