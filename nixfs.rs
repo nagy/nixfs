@@ -321,8 +321,8 @@ fn nix_build_attr(attr_path: &str, nixpkgs: &str) -> Result<String, NixError> {
     nix_build(&["--attr", attr_path, nixpkgs])
 }
 
-/// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>; }'`.
-/// Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
+/// Runs `nix-build --no-out-link --expr 'with import <nixpkgs> {}; srcOnly { src = <attr_path>;
+/// }'`. Unpacks a source archive (with patches applied) via nixpkgs' srcOnly.
 /// Returns the store path to the unpacked source directory.
 fn nix_build_src_only(attr_path: &str, nixpkgs: &str) -> Result<String, NixError> {
     let expr = format!(
@@ -382,8 +382,8 @@ fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
     let message = stderr.trim().to_string();
     // If nix eval failed because it's a set, treat as a directory:
     //   - "value is a set"  (old nix versions)
-    //   - "attribute 'outPath' in selection path '...outPath' not found"
-    //     (modern nix — means the attr exists but isn't a derivation)
+    //   - "attribute 'outPath' in selection path '...outPath' not found" (modern nix — means the
+    //     attr exists but isn't a derivation)
     let is_directory = stderr.contains("value is a set")
         || stderr.contains("attribute 'outPath' in selection path")
         || stderr.contains("'outpath' in selection path");
@@ -822,8 +822,8 @@ fn preflight(nixpkgs: &str) -> Result<(), String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
-            "nix eval against {nixpkgs} failed: {stderr}\n\
-             Hint: check NIX_PATH (or pass --nixpkgs) and that the nix-command feature is available."
+            "nix eval against {nixpkgs} failed: {stderr}\nHint: check NIX_PATH (or pass \
+             --nixpkgs) and that the nix-command feature is available."
         ));
     }
     Ok(())
@@ -831,11 +831,10 @@ fn preflight(nixpkgs: &str) -> Result<(), String> {
 
 fn print_usage(program: &str) {
     eprintln!(
-        "Usage: {program} [OPTIONS] [MOUNTPOINT]\n\n\
-         Mount Nix package attributes as a FUSE filesystem.\n\n\
-         Options:\n  --nixpkgs EXPR   resolve attributes from EXPR (default: <nixpkgs>)\n  \
-         -h, --help       show this help and exit\n  --version        print version and exit\n\n\
-         If no mountpoint is given, defaults to /nixfs.\n"
+        "Usage: {program} [OPTIONS] [MOUNTPOINT]\n\nMount Nix package attributes as a FUSE \
+         filesystem.\n\nOptions:\n  --nixpkgs EXPR   resolve attributes from EXPR (default: \
+         <nixpkgs>)\n  -h, --help       show this help and exit\n  --version        print version \
+         and exit\n\nIf no mountpoint is given, defaults to /nixfs.\n"
     );
 }
 

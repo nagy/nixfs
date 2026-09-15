@@ -87,25 +87,30 @@ Parsing is hand-rolled in `parse_args` (tested); switch to clap only if subcomma
 
 ### Nix build
 
+Nix packaging uses a flake (flake-parts + crane + treefmt-nix):
+
 ```bash
-nix-build --expr 'let pkgs = import <nixpkgs> {}; in pkgs.callPackage ./default.nix {}'
+nix build           # packages.default
+nix flake check     # cargoTest + treefmt + devShell
+nix fmt             # nixfmt + rustfmt + taplo (config lives in flake.nix)
 ```
 
 `versionCheckHook` runs `nixfs --version` during installCheck and requires the package `version` string in its output.
-Keep `default.nix`'s `version` in sync with `Cargo.toml` (both `0.1.0`).
+The flake's crane `buildPackage` reads the version from `Cargo.toml` — no separate version to keep in sync.
+Runtime deps (`fuse3` for fusermount3, `nix`/`nix-build`) are propagated by the flake package.
 
 ### NixOS VM test
 
 ```bash
-nix-build --expr 'let pkgs = import <nixpkgs> {}; in pkgs.callPackage ./default.nix {}' \
-  -A passthru.tests.nixfs
+nix build .#passthru.tests.nixfs
 ```
 
 Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink + binary output, unmounts.
 
 ## Style notes
 
-- `rustfmt.toml` (from rkyv, `max_width = 100`) — the unstable options (`imports_granularity = "Crate"`, `group_imports = "StdExternalCrate"`) need `rustfmt --edition 2024 --config 'imports_granularity=Crate,group_imports=StdExternalCrate'`.
+- Formatting via `nix fmt` (treefmt: nixfmt, rustfmt edition 2024, taplo).
+  Rust fmt options (former `rustfmt.toml`, incl. `max_width = 100`) live in `flake.nix` under `settings.formatter.rustfmt.options`.
 - Single file (`nixfs.rs`) for now; modules planned.
 - `eprintln!` used for debug logging (stderr of the mount process).
 - No async runtime.
