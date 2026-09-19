@@ -1,3 +1,9 @@
+//! FUSE filesystem exposing Nix attributes as symlinks.
+//!
+//! Maps Nix package attributes to virtual symlinks: a lookup of `vim`
+//! resolves against the configured nixpkgs expression, and reading the
+//! symlink triggers `nix-build` so the store path exists when accessed.
+
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     ffi::OsStr,
@@ -81,9 +87,10 @@ type Slot = (Mutex<Option<BuildResult>>, Condvar);
 /// Outcome of resolving a symlink target.
 type BuildResult = Result<String, NixError>;
 
-struct NixFS {
+/// FUSE filesystem state: the shared cache plus the configured nixpkgs.
+pub struct NixFS {
     cache: Arc<Mutex<Cache>>,
-    /// Nixpkgs expression to resolve attributes from (--nixpkgs, default <nixpkgs>).
+    /// Nixpkgs expression to resolve attributes from (--nixpkgs, default `<nixpkgs>`).
     nixpkgs: String,
 }
 
@@ -92,7 +99,8 @@ fn lock_cache(cache: &Arc<Mutex<Cache>>) -> MutexGuard<'_, Cache> {
 }
 
 impl NixFS {
-    fn new(nixpkgs: String) -> Self {
+    /// Create an empty filesystem resolving attributes from `nixpkgs`.
+    pub fn new(nixpkgs: String) -> Self {
         Self {
             cache: Arc::new(Mutex::new(Cache {
                 entries: HashMap::new(),
@@ -208,7 +216,27 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Hash an attribute path to a deterministic 64-bit inode.
-const fn inode_for_attr_path(attr_path: &str) -> u64 {
+///
+/// FNV-1a 64-bit: deterministic across processes and remounts, unlike
+/// `DefaultHasher` (which is randomly seeded per-process).
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::inode_for_attr_path;
+/// // FNV-1a of the empty input is the offset basis.
+/// assert_eq!(inode_for_attr_path(""), 0xcbf2_9ce4_8422_2325);
+/// // Reference vectors from the FNV-1a specification pin the algorithm.
+/// assert_eq!(inode_for_attr_path("a"), 0xaf63_dc4c_8601_ec8c);
+/// assert_eq!(inode_for_attr_path("foobar"), 0x8594_4171_f739_67e8);
+/// // The @unpacked suffix must produce a distinct inode.
+/// assert_ne!(
+///     inode_for_attr_path("qemu.src"),
+///     inode_for_attr_path("qemu.src@unpacked")
+/// );
+/// ```
+#[must_use]
+pub const fn inode_for_attr_path(attr_path: &str) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     let bytes = attr_path.as_bytes();
     let mut i = 0;
@@ -332,16 +360,41 @@ fn nix_build_src_only(attr_path: &str, nixpkgs: &str) -> Result<String, NixError
     nix_build(&["--expr", &expr])
 }
 
-/// Classified result of a failed `nix eval`/`nix-build` invocation:
-/// the errno to reply to FUSE, plus the actual stderr message.
+/// Classified error from a failed `nix eval`/`nix-build` invocation.
+///
+/// Carries the errno to reply to FUSE plus the actual stderr message
+/// (surfaced via the `user.error` xattr).
 #[derive(Debug, PartialEq, Clone)]
-struct NixError {
-    errno: i32,
-    message: String,
+pub struct NixError {
+    /// Errno to reply to the FUSE request with.
+    pub errno: i32,
+    /// Raw stderr of the failed nix invocation.
+    pub message: String,
 }
 
 /// Maps `nix eval`/`nix-build` stderr to a specific errno.
-fn classify_eval_error(stderr: &str) -> i32 {
+///
+/// Matches the final `error:` line, not build-log noise: bare words like
+/// "network" appear in unrelated messages (e.g. network namespaces).
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::classify_eval_error;
+/// // Missing attribute (nix eval / nix-build --attr)
+/// assert_eq!(
+///     classify_eval_error("error: attribute 'x' in selection path 'x.outPath' not found"),
+///     2 // ENOENT
+/// );
+/// // Missing attr via the srcOnly path (undefined variable)
+/// assert_eq!(classify_eval_error("error: undefined variable 'x'"), 2); // ENOENT
+/// assert_eq!(classify_eval_error("error: timed out"), 110); // ETIMEDOUT
+/// assert_eq!(classify_eval_error("error: network is unreachable"), 101); // ENETUNREACH
+/// assert_eq!(classify_eval_error("error: permission denied"), 13); // EACCES
+/// // Unknown failure → generic EIO
+/// assert_eq!(classify_eval_error("error: some random failure"), 5); // EIO
+/// ```
+pub fn classify_eval_error(stderr: &str) -> i32 {
     // Match the final `error:` line, not build-log noise: bare words like
     // "network" appear in unrelated messages (e.g. network namespaces).
     if stderr.contains("does not provide attribute")
@@ -375,10 +428,25 @@ fn classify_eval_error(stderr: &str) -> i32 {
     }
 }
 
-/// Returns a `NixError` classified from `stderr`, or `None` if the stderr
+/// Classify nix stderr, or `None` when it describes a directory.
+///
+/// Returns a [`NixError`] classified from `stderr`, or `None` if the stderr
 /// indicates a *successful* evaluation of a non-derivation (an attr set),
 /// which `nix_eval_attr` must treat as a directory.
-fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::classify_nix_stderr;
+/// // Attr-set stderr means "it's a directory", not an error.
+/// assert_eq!(classify_nix_stderr("error: value is a set"), None);
+/// // Everything else is a classified error carrying the raw stderr.
+/// let err = classify_nix_stderr("error: attribute 'x' in selection path 'x.outPath' not found")
+///     .unwrap();
+/// assert_eq!(err.errno, 2); // ENOENT
+/// assert!(err.message.contains("not found"));
+/// ```
+pub fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
     let message = stderr.trim().to_string();
     // If nix eval failed because it's a set, treat as a directory:
     //   - "value is a set"  (old nix versions)
@@ -397,10 +465,25 @@ fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
     }
 }
 
-/// How to answer an xattr request for a payload of `len` bytes against the
-/// kernel's `size` probe, per the FUSE xattr protocol.
+/// How to answer a kernel xattr `size` probe.
+///
+/// Per the FUSE xattr protocol, the caller first sends a size-0 `getxattr`
+/// to learn the payload length, then re-requests with a buffer of that size.
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::{xattr_outcome, XattrReply};
+/// // size-0 probe: reply the total length so the caller can allocate.
+/// assert_eq!(xattr_outcome(0, 0), XattrReply::Size);
+/// assert_eq!(xattr_outcome(0, 123), XattrReply::Size);
+/// // Payload fits the caller's buffer.
+/// assert_eq!(xattr_outcome(123, 123), XattrReply::Data);
+/// // Payload does not fit: reply ERANGE.
+/// assert_eq!(xattr_outcome(100, 123), XattrReply::Range);
+/// ```
 #[derive(Debug, PartialEq)]
-enum XattrReply {
+pub enum XattrReply {
     /// size == 0: reply the total length so the caller can allocate.
     Size,
     /// The payload fits: send it.
@@ -409,7 +492,18 @@ enum XattrReply {
     Range,
 }
 
-fn xattr_outcome(size: u32, len: usize) -> XattrReply {
+/// Decide how to reply to a kernel xattr `size` probe.
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::{xattr_outcome, XattrReply};
+/// assert_eq!(xattr_outcome(0, 123), XattrReply::Size);
+/// assert_eq!(xattr_outcome(123, 123), XattrReply::Data);
+/// assert_eq!(xattr_outcome(100, 123), XattrReply::Range);
+/// ```
+#[must_use]
+pub fn xattr_outcome(size: u32, len: usize) -> XattrReply {
     if size == 0 {
         XattrReply::Size
     } else if len > size as usize {
@@ -428,14 +522,31 @@ fn reply_xattr(size: u32, data: &[u8], reply: ReplyXattr) {
     }
 }
 
-/// Whether `name` is a valid Nix attr-path: non-empty dot-separated segments,
-/// each starting with an ASCII alphanumeric or `_` and continuing with
-/// alphanumeric, `_`, `'` or `-`. Matches every attr found in the measured
-/// nixpkgs sets (27,772 top-level, 11,791 python3Packages, 19,523
-/// haskellPackages, incl. digit-leading names like `2captcha`) while
-/// rejecting junk (spaces, `@`, `;`, `}`, quotes, empty segments) before any
-/// nix subprocess is spawned.
-fn is_valid_attr_name(name: &str) -> bool {
+/// Check whether `name` is a valid Nix attr-path.
+///
+/// Valid names are non-empty dot-separated segments, each starting with an
+/// ASCII alphanumeric or `_` and continuing with alphanumeric, `_`, `'` or
+/// `-`. Matches every attr found in the measured nixpkgs sets (27,772
+/// top-level, 11,791 python3Packages, 19,523 haskellPackages, incl.
+/// digit-leading names like `2captcha`) while rejecting junk (spaces, `@`,
+/// `;`, `}`, quotes, empty segments) before any nix subprocess is spawned.
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::is_valid_attr_name;
+/// assert!(is_valid_attr_name("vim"));
+/// assert!(is_valid_attr_name("python3Packages.numpy"));
+/// // Digit-leading segments are real attrs and must stay reachable.
+/// assert!(is_valid_attr_name("haskellPackages.2captcha"));
+/// assert!(!is_valid_attr_name("")); // empty
+/// assert!(!is_valid_attr_name(".hidden")); // dotfile
+/// assert!(!is_valid_attr_name("foo.")); // empty segment
+/// assert!(!is_valid_attr_name("a b")); // junk
+/// assert!(!is_valid_attr_name("x} ; id")); // injection attempt
+/// ```
+#[must_use]
+pub fn is_valid_attr_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && !name.ends_with('.')
@@ -725,23 +836,62 @@ impl fuser::Filesystem for NixFS {
 
 /// Parsed command line.
 #[derive(Debug, PartialEq)]
-struct Cli {
-    mount_path: String,
-    nixpkgs: String,
-    action: CliAction,
+pub struct Cli {
+    /// Where to mount the filesystem (`/nixfs` when unspecified).
+    pub mount_path: String,
+    /// Nixpkgs expression to resolve attributes from.
+    pub nixpkgs: String,
+    /// What the process should do with the parsed arguments.
+    pub action: CliAction,
 }
 
 /// What the process should do, derived from the parsed command line.
 #[derive(Debug, PartialEq)]
-enum CliAction {
+pub enum CliAction {
+    /// Mount the filesystem at [`Cli::mount_path`].
     Mount,
+    /// Print usage and exit 0.
     Help,
+    /// Print the version and exit 0.
     Version,
 }
 
-/// Parse command-line arguments (argv[1..]). Usage errors are returned as a
-/// message; the caller prints usage and exits 2.
-fn parse_args(args: &[String]) -> Result<Cli, String> {
+/// Parse command-line arguments (argv[1..]).
+///
+/// Usage errors are returned as a message; the caller prints usage and
+/// exits 2.
+///
+/// # Examples
+///
+/// ```
+/// # use nixfs::{parse_args, CliAction};
+/// // No arguments: default mountpoint and nixpkgs.
+/// let cli = parse_args(&[]).unwrap();
+/// assert_eq!(cli.mount_path, "/nixfs");
+/// assert_eq!(cli.nixpkgs, "<nixpkgs>");
+/// assert_eq!(cli.action, CliAction::Mount);
+///
+/// // `--nixpkgs=EXPR` overrides the nixpkgs expression.
+/// let cli = parse_args(&["--nixpkgs=nixpkgs/nixos-unstable".to_string()]).unwrap();
+/// assert_eq!(cli.nixpkgs, "nixpkgs/nixos-unstable");
+///
+/// // Flags short-circuit mounting; order relative to the mountpoint is free.
+/// assert_eq!(
+///     parse_args(&["--version".to_string()]).unwrap().action,
+///     CliAction::Version
+/// );
+/// assert_eq!(
+///     parse_args(&["/mnt".to_string(), "-h".to_string()])
+///         .unwrap()
+///         .action,
+///     CliAction::Help
+/// );
+///
+/// // Unknown options and extra mountpoints are usage errors (caller exits 2).
+/// assert!(parse_args(&["--bogus".to_string()]).is_err());
+/// assert!(parse_args(&["/mnt".to_string(), "/extra".to_string()]).is_err());
+/// ```
+pub fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut mount_path = None;
     let mut nixpkgs = NIXPKGS.to_string();
     let mut i = 0;
@@ -838,7 +988,13 @@ fn print_usage(program: &str) {
     );
 }
 
-fn main() {
+/// Binary entry point; all work happens in [`run`].
+pub fn main() {
+    run();
+}
+
+/// Entry point: parse argv, run preflight, and mount the filesystem.
+pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let program = std::env::args()
         .next()

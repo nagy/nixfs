@@ -12,6 +12,13 @@ pedantic = { level = "warn", priority = -1 }
 fuser = { version = "0.15.1", default-features = false }
 libc = "0.2.174"
 
+# The same file serves as lib and bin: the lib target is what makes
+# `cargo test --doc` (and thus doctests) possible for a bin-only crate.
+# (Cargo notes the shared path once per invocation — cosmetic only.)
+[lib]
+name = "nixfs"
+path = "nixfs.rs"
+
 [[bin]]
 name = "nixfs"
 path = "nixfs.rs"

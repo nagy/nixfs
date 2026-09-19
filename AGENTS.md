@@ -91,7 +91,8 @@ Nix packaging uses a flake (flake-parts + crane + treefmt-nix):
 
 ```bash
 nix build           # packages.default
-nix flake check     # cargoTest + treefmt + devShell
+nix build .#nixfs-doc   # static rustdoc HTML under $out/share/doc
+nix flake check     # cargoTest + doctests + treefmt + devShell
 nix fmt             # nixfmt + rustfmt + taplo (config lives in flake.nix)
 ```
 
@@ -112,6 +113,13 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
 - Formatting via `nix fmt` (treefmt: nixfmt, rustfmt edition 2024, taplo).
   Rust fmt options (former `rustfmt.toml`, incl. `max_width = 100`) live in `flake.nix` under `settings.formatter.rustfmt.options`.
 - Single file (`nixfs.rs`) for now; modules planned.
+  `nixfs.rs` is both the lib and the bin target (`[lib]` + `[[bin]]` share the
+  path) — the lib target is what makes `cargo test --doc` possible for a
+  bin-only crate. Cargo notes the shared path once per invocation (cosmetic).
+  Public surface: `run`/`main`, `parse_args`/`Cli`/`CliAction`, and the pure
+  helpers under doctest (`inode_for_attr_path`, `is_valid_attr_name`,
+  `xattr_outcome`/`XattrReply`, `classify_eval_error`, `classify_nix_stderr`,
+  `NixError`).
 - `eprintln!` used for debug logging (stderr of the mount process).
 - No async runtime.
   FUSE request loop is single-threaded; `readlink`'s `nix-build` runs on worker threads.
@@ -119,6 +127,10 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
   Covers `classify_eval_error`, `classify_nix_stderr`, `inode_for_attr_path`, `parse_args`, `is_valid_attr_name`,
   cache eviction, `resolve_symlink` concurrent dedup.
   Run with `cargo test`.
+- Doctests: `# Examples` blocks on the pure helpers above run under
+  `cargo test --doc` and as `checks.doctests` (`craneLib.cargoDocTest`) in
+  `nix flake check`; `packages.nixfs-doc` (`craneLib.cargoDoc`) is the
+  offline rustdoc HTML.
 
 ## Future investigation
 
