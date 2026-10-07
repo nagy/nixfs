@@ -12,9 +12,10 @@ use std::{
 };
 
 use fuser::{
-    FileAttr, FileType, MountOption, ReplyAttr, ReplyData, ReplyEntry, ReplyXattr, Request,
+    Config, Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, MountOption, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEntry, ReplyXattr, Request, SessionACL,
 };
-use libc::{EACCES, EINVAL, EIO, ENETUNREACH, ENODATA, ENOENT, ENOTDIR, ERANGE, ETIMEDOUT};
+use libc::{EACCES, EIO, ENETUNREACH, ENOENT, ETIMEDOUT};
 
 const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
@@ -29,7 +30,7 @@ fn make_attr(inode: u64, kind: FileType) -> FileAttr {
         _ => (0o444, 1),
     };
     FileAttr {
-        ino: inode,
+        ino: INodeNo(inode),
         size: 0,
         blocks: 0,
         atime: UNIX_EPOCH,
@@ -518,7 +519,7 @@ fn reply_xattr(size: u32, data: &[u8], reply: ReplyXattr) {
     match xattr_outcome(size, data.len()) {
         XattrReply::Size => reply.size(u32::try_from(data.len()).unwrap_or(u32::MAX)),
         XattrReply::Data => reply.data(data),
-        XattrReply::Range => reply.error(ERANGE),
+        XattrReply::Range => reply.error(Errno::ERANGE),
     }
 }
 
@@ -560,10 +561,10 @@ pub fn is_valid_attr_name(name: &str) -> bool {
 }
 
 impl fuser::Filesystem for NixFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         // Reject non-UTF-8 names — Nix attr names are always valid UTF-8.
         let Some(orig_name) = name.to_str() else {
-            reply.error(EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         // Reject names that look like dotfiles — invalid as Nix attr names.
@@ -576,7 +577,7 @@ impl fuser::Filesystem for NixFS {
         // Validate after stripping suffix: strict allowlist so junk names
         // never reach a nix subprocess (misleading ENOENT + eval cost).
         if !is_valid_attr_name(child_name) {
-            reply.error(EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         }
         eprintln!(
@@ -587,17 +588,17 @@ impl fuser::Filesystem for NixFS {
         // Resolve parent attr path for non-root lookups.
         let parent_attr = {
             let cache = lock_cache(&self.cache);
-            if parent == 1 {
+            if parent == INodeNo::ROOT {
                 None
             } else {
-                let Some(parent_entry) = cache.entries.get(&parent) else {
-                    reply.error(ENOENT);
+                let Some(parent_entry) = cache.entries.get(&u64::from(parent)) else {
+                    reply.error(Errno::ENOENT);
                     return;
                 };
                 let parent_path = if let EntryKind::Dir { attr_path, .. } = parent_entry {
                     attr_path.as_str()
                 } else {
-                    reply.error(ENOTDIR);
+                    reply.error(Errno::ENOTDIR);
                     return;
                 };
                 Some(parent_path.to_string())
@@ -628,7 +629,7 @@ impl fuser::Filesystem for NixFS {
                     EntryKind::Symlink { .. } => make_attr(inode, FileType::Symlink),
                     EntryKind::Dir { .. } => make_attr(inode, FileType::Directory),
                 };
-                reply.entry(&CACHE_TTL, &attr, 0);
+                reply.entry(&CACHE_TTL, &attr, Generation(0));
                 return;
             }
         }
@@ -637,7 +638,11 @@ impl fuser::Filesystem for NixFS {
             Ok(AttrKind::Derivation) => {
                 // Create a stub — the actual build happens lazily in readlink
                 // so the symlink target is guaranteed to exist when accessed.
-                reply.entry(&CACHE_TTL, &make_attr(inode, FileType::Symlink), 0);
+                reply.entry(
+                    &CACHE_TTL,
+                    &make_attr(inode, FileType::Symlink),
+                    Generation(0),
+                );
                 lock_cache(&self.cache).insert_entry(
                     inode,
                     EntryKind::Symlink {
@@ -650,7 +655,11 @@ impl fuser::Filesystem for NixFS {
                 );
             }
             Ok(AttrKind::Directory) => {
-                reply.entry(&CACHE_TTL, &make_attr(inode, FileType::Directory), 0);
+                reply.entry(
+                    &CACHE_TTL,
+                    &make_attr(inode, FileType::Directory),
+                    Generation(0),
+                );
                 lock_cache(&self.cache).insert_entry(
                     inode,
                     EntryKind::Dir {
@@ -659,7 +668,7 @@ impl fuser::Filesystem for NixFS {
                 );
             }
             Err(e) => {
-                reply.error(e.errno);
+                reply.error(Errno::from_i32(e.errno));
                 // No entry is inserted on failure, so the message cannot be
                 // surfaced via the user.error xattr: the path does not exist,
                 // so getfattr never reaches getxattr. It is only in the
@@ -668,24 +677,25 @@ impl fuser::Filesystem for NixFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if ino == 1 {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if ino == INodeNo::ROOT {
             reply.attr(&CACHE_TTL, &make_attr(1, FileType::Directory));
             return;
         }
         let cache = lock_cache(&self.cache);
-        if let Some(entry) = cache.entries.get(&ino) {
+        if let Some(entry) = cache.entries.get(&u64::from(ino)) {
             let attr = match entry {
-                EntryKind::Symlink { .. } => make_attr(ino, FileType::Symlink),
-                EntryKind::Dir { .. } => make_attr(ino, FileType::Directory),
+                EntryKind::Symlink { .. } => make_attr(ino.0, FileType::Symlink),
+                EntryKind::Dir { .. } => make_attr(ino.0, FileType::Directory),
             };
             reply.attr(&CACHE_TTL, &attr);
             return;
         }
-        reply.error(ENOENT);
+        reply.error(Errno::ENOENT);
     }
 
-    fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, inode: INodeNo, reply: ReplyData) {
+        let inode = u64::from(inode);
         let cache = self.cache.clone();
         let nixpkgs = self.nixpkgs.clone();
 
@@ -695,11 +705,11 @@ impl fuser::Filesystem for NixFS {
             let cache = lock_cache(&cache);
             match cache.entries.get(&inode) {
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
                 Some(EntryKind::Dir { .. }) => {
-                    reply.error(EINVAL);
+                    reply.error(Errno::EINVAL);
                     return;
                 }
                 Some(EntryKind::Symlink {
@@ -718,10 +728,10 @@ impl fuser::Filesystem for NixFS {
                             return;
                         }
                         if let Some((errno, _)) = error {
-                            reply.error(*errno);
+                            reply.error(Errno::from_i32(*errno));
                             return;
                         }
-                        reply.error(EIO);
+                        reply.error(Errno::EIO);
                         return;
                     }
                 }
@@ -741,36 +751,38 @@ impl fuser::Filesystem for NixFS {
             });
             match result {
                 Ok(path) => reply.data(path.as_bytes()),
-                Err(err) => reply.error(err.errno),
+                Err(err) => reply.error(Errno::from_i32(err.errno)),
             }
         });
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: fuser::ReplyDirectory,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
     ) {
         // Directories are always empty — Nix attribute discovery is not
         // provided via readdir.  Packages are resolved only through explicit
         // lookup + readlink (e.g.  ls -l /nixfs/vim).
         let parent_inode = {
             let cache = lock_cache(&self.cache);
-            if ino == 1 {
-                1
-            } else if let Some(EntryKind::Dir { attr_path }) = cache.entries.get(&ino) {
-                attr_path.rsplit_once('.').map_or(1, |(parent_path, _)| {
-                    if parent_path.is_empty() {
-                        1
-                    } else {
-                        inode_for_attr_path(parent_path)
-                    }
-                })
+            if ino == INodeNo::ROOT {
+                INodeNo::ROOT
+            } else if let Some(EntryKind::Dir { attr_path }) = cache.entries.get(&u64::from(ino)) {
+                attr_path
+                    .rsplit_once('.')
+                    .map_or(INodeNo::ROOT, |(parent_path, _)| {
+                        if parent_path.is_empty() {
+                            INodeNo::ROOT
+                        } else {
+                            INodeNo(inode_for_attr_path(parent_path))
+                        }
+                    })
             } else {
-                reply.error(ENOTDIR);
+                reply.error(Errno::ENOTDIR);
                 return;
             }
         };
@@ -779,30 +791,29 @@ impl fuser::Filesystem for NixFS {
             (ino, FileType::Directory, "."),
             (parent_inode, FileType::Directory, ".."),
         ];
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_possible_wrap
-        )]
-        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+        for (i, entry) in entries
+            .into_iter()
+            .enumerate()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        {
+            if reply.add(entry.0, (i + 1) as u64, entry.1, entry.2) {
                 break;
             }
         }
         reply.ok();
     }
 
-    fn forget(&mut self, _req: &Request, ino: u64, _nlookup: u64) {
-        lock_cache(&self.cache).remove_entry(ino);
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+        lock_cache(&self.cache).remove_entry(u64::from(ino));
     }
 
-    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let Some(name_str) = name.to_str() else {
-            reply.error(ENODATA);
+            reply.error(Errno::ENODATA);
             return;
         };
         if name_str != "user.error" {
-            reply.error(ENODATA);
+            reply.error(Errno::ENODATA);
             return;
         }
         let msg = {
@@ -810,22 +821,22 @@ impl fuser::Filesystem for NixFS {
             if let Some(EntryKind::Symlink {
                 error: Some((_, msg)),
                 ..
-            }) = cache.entries.get(&ino)
+            }) = cache.entries.get(&u64::from(ino))
             {
                 msg.clone()
             } else {
-                reply.error(ENODATA);
+                reply.error(Errno::ENODATA);
                 return;
             }
         };
         reply_xattr(size, msg.as_bytes(), reply);
     }
 
-    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let has_error = {
             let cache = lock_cache(&self.cache);
             matches!(
-                cache.entries.get(&ino),
+                cache.entries.get(&u64::from(ino)),
                 Some(EntryKind::Symlink { error: Some(_), .. })
             )
         };
@@ -1025,16 +1036,17 @@ pub fn run() {
         }
     }
 
-    if let Err(e) = fuser::mount2(
-        NixFS::new(cli.nixpkgs),
-        &cli.mount_path,
-        &[
-            MountOption::RO,
-            MountOption::FSName("nixfs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::AllowRoot,
-        ],
-    ) {
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::RO,
+        MountOption::FSName("nixfs".to_string()),
+        MountOption::AutoUnmount,
+    ];
+    // AutoUnmount requires a non-Owner ACL; RootAndOwner matches the old
+    // AllowRoot mount option.
+    config.acl = SessionACL::RootAndOwner;
+
+    if let Err(e) = fuser::mount(NixFS::new(cli.nixpkgs), &cli.mount_path, &config) {
         eprintln!("Failed to mount {}: {e}", cli.mount_path);
         eprintln!(
             "Hint: make sure {} exists and is not already mounted (try `fusermount3 -u {}`).",

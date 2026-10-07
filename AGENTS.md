@@ -11,6 +11,8 @@ Mount at `/nixfs` (or any path), then access e.g. `/nixfs/vim` to get a symlink 
 - Nix tooling required at runtime: `nix`, `nix-build`.
 - `fusermount3` (from `fuse3`) required at runtime for mounting.
   fuser uses the pure-rust mount backend (no libfuse; `default-features = false`).
+  fuser 0.18 API: `fuser::mount` (renamed from `mount2`), `Config` mount options, `SessionACL`.
+  `Filesystem` methods take `&self` and use newtypes (`INodeNo`, `FileHandle`, `Errno`, `Generation`).
 - `nixfs` passes `--extra-experimental-features nix-command` to `nix eval` itself.
   Runs a mount-time preflight (`nix`/`nix-build` on PATH, `nix eval` working against the configured nixpkgs) — no user `nix.conf` needed.
 - See `Cargo.toml` for Rust edition, dependencies, and binary layout.
