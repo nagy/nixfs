@@ -1,8 +1,9 @@
 //! FUSE filesystem exposing Nix attributes as symlinks.
 //!
-//! Maps Nix package attributes to virtual symlinks: a lookup of `vim`
-//! resolves against the configured nixpkgs expression, and reading the
-//! symlink triggers `nix-build` so the store path exists when accessed.
+//! Maps Nix package attributes to virtual symlinks.
+//! A lookup of `vim` resolves against the configured nixpkgs expression.
+//! Reading the symlink triggers `nix-build`.
+//! The store path then exists when accessed.
 
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
@@ -21,7 +22,8 @@ const NIX_EXECUTABLE: &str = "nix";
 const NIXPKGS: &str = "<nixpkgs>";
 /// How long cached directory listings and resolved store paths remain valid.
 const CACHE_TTL: Duration = Duration::from_mins(5); // 5 minutes
-/// Upper bound on cached entries; the oldest are evicted (FIFO) beyond this.
+/// Upper bound on cached entries.
+/// Evict the oldest entries (FIFO) beyond this cap.
 const MAX_ENTRIES: usize = 10_000;
 
 fn make_attr(inode: u64, kind: FileType) -> FileAttr {
@@ -49,36 +51,41 @@ fn make_attr(inode: u64, kind: FileType) -> FileAttr {
 }
 
 enum EntryKind {
-    /// A Nix derivation — appears as a symlink.
+    /// A Nix derivation. Appears as a symlink.
     Symlink {
-        /// Dotted attr path, e.g. "python3Packages.numpy". Used for lazy resolution.
+        /// Dotted attr path, e.g. "python3Packages.numpy".
+        /// Used for lazy resolution.
         attr_path: String,
-        /// Cached store path. None if created by readdir (resolved lazily).
+        /// Cached store path.
+        /// None for stub entries from readdir. Resolution happens lazily.
         out_path: Option<String>,
-        /// When this store path was last resolved (or last attempted).
+        /// Time of the last resolution attempt of this store path.
         created: Instant,
         /// Whether to resolve via srcOnly (unpack source) instead of nix-build --attr.
         src_only: bool,
-        /// Last failed build: (errno, message).  None on success or untried.
-        /// `readlink` replies the errno; the `user.error` xattr shows the message.
+        /// Last failed build: (errno, message).
+        /// None on success or untried.
+        /// `readlink` replies the errno.
+        /// The `user.error` xattr shows the message.
         error: Option<(i32, String)>,
     },
-    /// A Nix attribute set — appears as a directory.
+    /// A Nix attribute set. Appears as a directory.
     Dir {
         /// Dotted attr path, e.g. "python3Packages".
         attr_path: String,
     },
 }
 
-/// Shared cache: entries, FIFO eviction order, and in-flight resolution
-/// slots. Everything is behind one mutex; blocking nix subprocesses must
-/// never run while it is held.
+/// Shared cache: entries, FIFO eviction order, and in-flight resolution slots.
+/// One mutex guards everything.
+/// Do not run blocking nix subprocesses while holding the mutex.
 struct Cache {
     entries: HashMap<u64, EntryKind>,
     /// Insertion order of `entries` (back = newest), for FIFO eviction.
     order: VecDeque<u64>,
-    /// In-flight symlink resolutions: inode -> completion slot. The builder
-    /// fills the slot, waiters block on the condvar instead of rebuilding.
+    /// In-flight symlink resolutions: inode -> completion slot.
+    /// The builder fills the slot.
+    /// Waiters block on the condvar instead of rebuilding.
     inflight: HashMap<u64, Arc<Slot>>,
 }
 
@@ -134,9 +141,9 @@ impl Cache {
     }
 }
 
-/// Resolve a symlink entry, deduplicating concurrent resolutions of the same
-/// inode. Runs on a worker thread off the FUSE request loop; the caller's
-/// `build` closure must not touch the cache.
+/// Resolve a symlink entry and deduplicate concurrent resolutions of the same inode.
+/// Runs on a worker thread off the FUSE request loop.
+/// The `build` closure from the caller must not touch the cache.
 fn resolve_symlink<F>(cache: &Arc<Mutex<Cache>>, inode: u64, build: F) -> BuildResult
 where
     F: FnOnce(bool, &str) -> BuildResult + Send,
@@ -212,20 +219,20 @@ where
 }
 
 // FNV-1a 64-bit: deterministic across processes and remounts, unlike
-// DefaultHasher (which is randomly seeded per-process).
+// DefaultHasher (random seed per process).
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Hash an attribute path to a deterministic 64-bit inode.
 ///
 /// FNV-1a 64-bit: deterministic across processes and remounts, unlike
-/// `DefaultHasher` (which is randomly seeded per-process).
+/// `DefaultHasher` (random seed per process).
 ///
 /// # Examples
 ///
 /// ```
 /// # use nixfs::inode_for_attr_path;
-/// // FNV-1a of the empty input is the offset basis.
+/// // FNV-1a of the empty input yields the offset basis.
 /// assert_eq!(inode_for_attr_path(""), 0xcbf2_9ce4_8422_2325);
 /// // Reference vectors from the FNV-1a specification pin the algorithm.
 /// assert_eq!(inode_for_attr_path("a"), 0xaf63_dc4c_8601_ec8c);
@@ -242,7 +249,7 @@ pub const fn inode_for_attr_path(attr_path: &str) -> u64 {
     let bytes = attr_path.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // Note: `as u64`, not `u64::from` — From is not yet const-stable.
+        // Note: `as u64` here. `u64::from` lacks const support today.
         hash ^= bytes[i] as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
         i += 1;
@@ -251,7 +258,7 @@ pub const fn inode_for_attr_path(attr_path: &str) -> u64 {
 }
 
 // Compile-time invariants of the inode scheme (mirror of the runtime tests):
-// inode 0 is reserved in FUSE, inode 1 is the root, and the @unpacked
+// FUSE reserves inode 0, inode 1 stays the root, and the @unpacked
 // suffix must change the inode. A violation fails the build.
 const _: () = assert!(
     inode_for_attr_path("") != 0,
@@ -268,15 +275,15 @@ const _: () = assert!(
 
 /// What kind of Nix attribute exists at a given dotted path.
 enum AttrKind {
-    /// The attribute is a derivation.
+    /// A derivation attribute.
     Derivation,
-    /// The attribute is an attr set (i.e. a directory).
+    /// An attr set attribute. Appears as a directory.
     Directory,
 }
 
 /// Runs `nix eval --raw -f '<nixpkgs>' '<attr_path>.outPath'`.
-/// Evaluates the derivation (no build) — fast, but the resulting store path
-/// may not exist yet if the derivation hasn't been built or substituted.
+/// Evaluates the derivation without a build.
+/// Evaluation runs fast, but the resulting store path possibly still lacks a build or substitution.
 /// Used in `lookup` for existence checking.
 fn nix_eval_attr(attr_path: &str, nixpkgs: &str) -> Result<AttrKind, NixError> {
     let expr = format!("{attr_path}.outPath");
@@ -302,7 +309,7 @@ fn nix_eval_attr(attr_path: &str, nixpkgs: &str) -> Result<AttrKind, NixError> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("nix_eval_attr failed (status {}): {stderr}", output.status);
-        // If nix eval failed because it's a set, treat as a directory
+        // If nix eval fails on a set, treat the attribute as a directory
         // (classify_nix_stderr returns None for that case).
         classify_nix_stderr(&stderr).map_or(Ok(AttrKind::Directory), Err)
     }
@@ -333,8 +340,8 @@ fn nix_build(extra_args: &[&str]) -> Result<String, NixError> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("nix_build failed: {stderr}");
         Err(classify_nix_stderr(&stderr).unwrap_or_else(|| {
-            // classify_nix_stderr returns None only for the "is a set" case,
-            // which can't happen here (nix-build fails differently).
+            // classify_nix_stderr returns None only for the set case.
+            // That case cannot happen here (nix-build fails differently).
             NixError {
                 errno: EIO,
                 message: stderr.trim().to_string(),
@@ -342,9 +349,9 @@ fn nix_build(extra_args: &[&str]) -> Result<String, NixError> {
         }))
     }
 }
-/// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to actually
-/// build (or substitute) the derivation. Returns the store path on success,
-/// or an errno on failure. Used in `readlink` so the symlink target exists.
+/// Runs `nix-build --no-out-link --attr <attr_path> <nixpkgs>` to build (or substitute) the
+/// derivation. Returns the store path on success, or an errno on failure.
+/// `readlink` uses this so the symlink target exists.
 fn nix_build_attr(attr_path: &str, nixpkgs: &str) -> Result<String, NixError> {
     eprintln!("Building: {attr_path:?} from {nixpkgs:?}");
     nix_build(&["--attr", attr_path, nixpkgs])
@@ -364,7 +371,7 @@ fn nix_build_src_only(attr_path: &str, nixpkgs: &str) -> Result<String, NixError
 /// Classified error from a failed `nix eval`/`nix-build` invocation.
 ///
 /// Carries the errno to reply to FUSE plus the actual stderr message
-/// (surfaced via the `user.error` xattr).
+/// (shown via the `user.error` xattr).
 #[derive(Debug, PartialEq, Clone)]
 pub struct NixError {
     /// Errno to reply to the FUSE request with.
@@ -439,9 +446,9 @@ pub fn classify_eval_error(stderr: &str) -> i32 {
 ///
 /// ```
 /// # use nixfs::classify_nix_stderr;
-/// // Attr-set stderr means "it's a directory", not an error.
+/// // Attr-set stderr means "directory", not an error.
 /// assert_eq!(classify_nix_stderr("error: value is a set"), None);
-/// // Everything else is a classified error carrying the raw stderr.
+/// // Everything else becomes a classified error carrying the raw stderr.
 /// let err = classify_nix_stderr("error: attribute 'x' in selection path 'x.outPath' not found")
 ///     .unwrap();
 /// assert_eq!(err.errno, 2); // ENOENT
@@ -449,10 +456,10 @@ pub fn classify_eval_error(stderr: &str) -> i32 {
 /// ```
 pub fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
     let message = stderr.trim().to_string();
-    // If nix eval failed because it's a set, treat as a directory:
+    // If nix eval fails on a set, treat the attribute as a directory:
     //   - "value is a set"  (old nix versions)
-    //   - "attribute 'outPath' in selection path '...outPath' not found" (modern nix — means the
-    //     attr exists but isn't a derivation)
+    //   - "attribute 'outPath' in selection path '...outPath' not found" (modern nix: the attr
+    //     exists but names no derivation)
     let is_directory = stderr.contains("value is a set")
         || stderr.contains("attribute 'outPath' in selection path")
         || stderr.contains("'outpath' in selection path");
@@ -480,7 +487,7 @@ pub fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
 /// assert_eq!(xattr_outcome(0, 123), XattrReply::Size);
 /// // Payload fits the caller's buffer.
 /// assert_eq!(xattr_outcome(123, 123), XattrReply::Data);
-/// // Payload does not fit: reply ERANGE.
+/// // Payload too large: reply ERANGE.
 /// assert_eq!(xattr_outcome(100, 123), XattrReply::Range);
 /// ```
 #[derive(Debug, PartialEq)]
@@ -489,7 +496,7 @@ pub enum XattrReply {
     Size,
     /// The payload fits: send it.
     Data,
-    /// The payload does not fit: reply ERANGE.
+    /// Payload too large: reply ERANGE.
     Range,
 }
 
@@ -523,14 +530,16 @@ fn reply_xattr(size: u32, data: &[u8], reply: ReplyXattr) {
     }
 }
 
-/// Check whether `name` is a valid Nix attr-path.
+/// Check whether `name` matches the Nix attr-path rules.
 ///
-/// Valid names are non-empty dot-separated segments, each starting with an
-/// ASCII alphanumeric or `_` and continuing with alphanumeric, `_`, `'` or
-/// `-`. Matches every attr found in the measured nixpkgs sets (27,772
-/// top-level, 11,791 python3Packages, 19,523 haskellPackages, incl.
-/// digit-leading names like `2captcha`) while rejecting junk (spaces, `@`,
-/// `;`, `}`, quotes, empty segments) before any nix subprocess is spawned.
+/// Valid names contain non-empty dot-separated segments.
+/// Each segment starts with an ASCII alphanumeric or `_`.
+/// Later characters stay alphanumeric, `_`, `'` or `-`.
+/// The check accepts every attr found in the measured nixpkgs sets
+/// (27,772 top-level, 11,791 python3Packages, 19,523 haskellPackages,
+/// incl. digit-leading names like `2captcha`).
+/// The check rejects junk (spaces, `@`, `;`, `}`, quotes, empty segments)
+/// before any nix subprocess spawn.
 ///
 /// # Examples
 ///
@@ -538,7 +547,7 @@ fn reply_xattr(size: u32, data: &[u8], reply: ReplyXattr) {
 /// # use nixfs::is_valid_attr_name;
 /// assert!(is_valid_attr_name("vim"));
 /// assert!(is_valid_attr_name("python3Packages.numpy"));
-/// // Digit-leading segments are real attrs and must stay reachable.
+/// // Digit-leading segments name real attrs and must stay reachable.
 /// assert!(is_valid_attr_name("haskellPackages.2captcha"));
 /// assert!(!is_valid_attr_name("")); // empty
 /// assert!(!is_valid_attr_name(".hidden")); // dotfile
@@ -562,12 +571,12 @@ pub fn is_valid_attr_name(name: &str) -> bool {
 
 impl fuser::Filesystem for NixFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        // Reject non-UTF-8 names — Nix attr names are always valid UTF-8.
+        // Reject non-UTF-8 names. Nix attr names contain only valid UTF-8.
         let Some(orig_name) = name.to_str() else {
             reply.error(Errno::EINVAL);
             return;
         };
-        // Reject names that look like dotfiles — invalid as Nix attr names.
+        // Reject dotfile names. A leading dot makes an invalid Nix attr name.
         // Allow '@unpacked' suffix for extended operations.
         let (child_name, src_only) = if let Some(base) = orig_name.strip_suffix("@unpacked") {
             (base, true)
@@ -621,7 +630,7 @@ impl fuser::Filesystem for NixFS {
         };
         let inode = inode_for_attr_path(&full_inode_path);
 
-        // If we already have an entry, just reply with it.
+        // For an already cached entry, just reply with it.
         {
             let cache = lock_cache(&self.cache);
             if let Some(entry) = cache.entries.get(&inode) {
@@ -636,8 +645,8 @@ impl fuser::Filesystem for NixFS {
 
         match nix_eval_attr(&child_path, &self.nixpkgs) {
             Ok(AttrKind::Derivation) => {
-                // Create a stub — the actual build happens lazily in readlink
-                // so the symlink target is guaranteed to exist when accessed.
+                // Create a stub. The actual build happens lazily in readlink,
+                // so the symlink target exists when accessed.
                 reply.entry(
                     &CACHE_TTL,
                     &make_attr(inode, FileType::Symlink),
@@ -669,9 +678,9 @@ impl fuser::Filesystem for NixFS {
             }
             Err(e) => {
                 reply.error(Errno::from_i32(e.errno));
-                // No entry is inserted on failure, so the message cannot be
-                // surfaced via the user.error xattr: the path does not exist,
-                // so getfattr never reaches getxattr. It is only in the
+                // A failure inserts no entry, so the message cannot reach
+                // the user.error xattr: getfattr never reaches getxattr on
+                // a nonexistent path. The message appears only in the
                 // daemon log above (nix_eval_attr eprintln).
             }
         }
@@ -699,8 +708,8 @@ impl fuser::Filesystem for NixFS {
         let cache = self.cache.clone();
         let nixpkgs = self.nixpkgs.clone();
 
-        // Fast path: resolved (or failed) recently — reply from the cache
-        // without spawning a thread.
+        // Fast path: resolved (or failed) recently.
+        // Reply from the cache without spawning a thread.
         {
             let cache = lock_cache(&cache);
             match cache.entries.get(&inode) {
@@ -721,7 +730,7 @@ impl fuser::Filesystem for NixFS {
                     let fresh =
                         (out_path.is_some() || error.is_some()) && created.elapsed() <= CACHE_TTL;
                     if fresh {
-                        // Build failed — surface the real errno instead of a
+                        // Build failed. Surface the real errno instead of a
                         // blanket EIO (message via the user.error xattr).
                         if let Some(path) = out_path {
                             reply.data(path.as_bytes());
@@ -764,8 +773,8 @@ impl fuser::Filesystem for NixFS {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        // Directories are always empty — Nix attribute discovery is not
-        // provided via readdir.  Packages are resolved only through explicit
+        // Directories always stay empty. readdir provides no Nix attribute
+        // discovery. Packages resolve only through explicit
         // lookup + readlink (e.g.  ls -l /nixfs/vim).
         let parent_inode = {
             let cache = lock_cache(&self.cache);
@@ -852,11 +861,11 @@ pub struct Cli {
     pub mount_path: String,
     /// Nixpkgs expression to resolve attributes from.
     pub nixpkgs: String,
-    /// What the process should do with the parsed arguments.
+    /// Action for the process, derived from the parsed arguments.
     pub action: CliAction,
 }
 
-/// What the process should do, derived from the parsed command line.
+/// Action for the process, derived from the parsed command line.
 #[derive(Debug, PartialEq)]
 pub enum CliAction {
     /// Mount the filesystem at [`Cli::mount_path`].
@@ -869,8 +878,8 @@ pub enum CliAction {
 
 /// Parse command-line arguments (argv[1..]).
 ///
-/// Usage errors are returned as a message; the caller prints usage and
-/// exits 2.
+/// Usage errors come back as a message.
+/// The caller prints usage and exits 2.
 ///
 /// # Examples
 ///
@@ -886,7 +895,7 @@ pub enum CliAction {
 /// let cli = parse_args(&["--nixpkgs=nixpkgs/nixos-unstable".to_string()]).unwrap();
 /// assert_eq!(cli.nixpkgs, "nixpkgs/nixos-unstable");
 ///
-/// // Flags short-circuit mounting; order relative to the mountpoint is free.
+/// // Flags short-circuit mounting. Any argument order works.
 /// assert_eq!(
 ///     parse_args(&["--version".to_string()]).unwrap().action,
 ///     CliAction::Version
@@ -898,7 +907,7 @@ pub enum CliAction {
 ///     CliAction::Help
 /// );
 ///
-/// // Unknown options and extra mountpoints are usage errors (caller exits 2).
+/// // Unknown options and extra mountpoints produce usage errors (caller exits 2).
 /// assert!(parse_args(&["--bogus".to_string()]).is_err());
 /// assert!(parse_args(&["/mnt".to_string(), "/extra".to_string()]).is_err());
 /// ```
@@ -953,10 +962,10 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
     })
 }
 
-/// Verify runtime prerequisites before mounting: `nix` and `nix-build` must
-/// be runnable, and `nix eval` must work against the configured nixpkgs.
-/// This also proves the `nix-command` experimental feature, which nixfs
-/// requests explicitly via `--extra-experimental-features`.
+/// Verify runtime prerequisites before mounting.
+/// `nix` and `nix-build` must run, and `nix eval` must work against the configured nixpkgs.
+/// This also proves the `nix-command` experimental feature.
+/// nixfs requests that feature explicitly via `--extra-experimental-features`.
 fn preflight(nixpkgs: &str) -> Result<(), String> {
     for tool in [NIX_EXECUTABLE, "nix-build"] {
         let output = std::process::Command::new(tool)
@@ -999,7 +1008,7 @@ fn print_usage(program: &str) {
     );
 }
 
-/// Binary entry point; all work happens in [`run`].
+/// Binary entry point. All work happens in [`run`].
 pub fn main() {
     run();
 }
@@ -1042,8 +1051,8 @@ pub fn run() {
         MountOption::FSName("nixfs".to_string()),
         MountOption::AutoUnmount,
     ];
-    // AutoUnmount requires a non-Owner ACL; RootAndOwner matches the old
-    // AllowRoot mount option.
+    // AutoUnmount requires a non-Owner ACL.
+    // RootAndOwner matches the old AllowRoot mount option.
     config.acl = SessionACL::RootAndOwner;
 
     if let Err(e) = fuser::mount(NixFS::new(cli.nixpkgs), &cli.mount_path, &config) {
@@ -1138,9 +1147,9 @@ mod tests {
 
     #[test]
     fn inode_for_attr_path_avoids_zero() {
-        // Inode 0 is invalid in FUSE (reserved); the empty string must not hash to it
+        // FUSE reserves inode 0. The empty string must not hash to it
         assert_ne!(inode_for_attr_path(""), 0);
-        // Non-empty real paths also must not collide with root (inode 1 is root)
+        // Non-empty real paths also must not collide with root (the root uses inode 1)
         assert_ne!(inode_for_attr_path("vim"), 1);
     }
 
