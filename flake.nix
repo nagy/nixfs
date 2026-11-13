@@ -38,7 +38,7 @@
 
           # fusermount3 (fuse3) is spawned at mount time; nix/nix-build are
           # spawned per lookup/readlink. Propagated so the nixfs closure
-          # carries them — same approach as default.nix.
+          # carries them.
           runtimeInputs = [
             pkgs.fuse3
             pkgs.nix
@@ -81,13 +81,15 @@
             meta.description = "nixfs doctests";
           };
 
-          # NixOS VM test (same as default.nix passthru.tests), attached to
-          # the package after the fact so the test can reference the final
-          # package. Self-reference is lazy — outPath never forces passthru.
+          # NixOS VM test. Self-reference is lazy: forcing `outPath` never
+          # forces passthru, so the test can install the final package.
           nixos-lib = import (pkgs.path + "/nixos/lib") { inherit (pkgs) lib; };
-          pkgWithTests = pkg.overrideAttrs (old: {
-            passthru = old.passthru or { } // {
-              tests.nixfs = nixos-lib.runTest {
+          vmTest =
+            nixfsPkg:
+            # `lib.addMetaAttrs` attaches the description: the nixosTest
+            # `meta` submodule has no `description` option.
+            lib.addMetaAttrs { description = "nixfs NixOS VM test"; } (
+              nixos-lib.runTest {
                 hostPkgs = pkgs;
 
                 name = "nixfs";
@@ -96,7 +98,7 @@
                   { pkgs, ... }:
                   {
                     environment.systemPackages = [
-                      pkgWithTests
+                      nixfsPkg
                       pkgs.hello
                       pkgs.fuse3
                     ];
@@ -114,7 +116,11 @@
                   machine.succeed("$(readlink /tmp/mnt/hello)/bin/hello | grep 'Hello'")
                   machine.succeed("fusermount3 -u /tmp/mnt")
                 '';
-              };
+              }
+            );
+          pkgWithTests = pkg.overrideAttrs (old: {
+            passthru = old.passthru or { } // {
+              tests.nixfs = vmTest pkgWithTests;
             };
           });
         in
@@ -129,6 +135,15 @@
           };
 
           checks.doctests = doctests;
+
+          # Clippy lint check, warnings as errors. Reuses cargoArtifacts, so
+          # only this crate re-compiles under the clippy driver. The crate
+          # declares no features, so --all-features costs nothing.
+          checks.clippy = craneLib.cargoClippy {
+            inherit src cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
+            meta.description = "nixfs Clippy check";
+          };
 
           apps.default = {
             type = "app";

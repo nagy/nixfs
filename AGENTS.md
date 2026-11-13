@@ -94,7 +94,7 @@ Nix packaging uses a flake (flake-parts + crane + treefmt-nix):
 ```bash
 nix build           # packages.default
 nix build .#nixfs-doc   # static rustdoc HTML under $out/share/doc
-nix flake check     # cargoTest + doctests + treefmt + devShell
+nix flake check     # clippy + cargoTest + doctests + treefmt + devShell
 nix fmt             # nixfmt + rustfmt + taplo (config lives in flake.nix)
 ```
 
@@ -109,6 +109,8 @@ nix build .#passthru.tests.nixfs
 ```
 
 Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink + binary output, unmounts.
+The flake attaches the test to `passthru.tests` and adds its `meta.description`
+with `lib.addMetaAttrs` (the nixosTest `meta` submodule has no `description` option).
 
 ## Style notes
 
@@ -133,6 +135,11 @@ Runs nixfs in a QEMU VM: mounts `/tmp/mnt`, resolves `hello`, verifies symlink +
   `cargo test --doc` and as `checks.doctests` (`craneLib.cargoDocTest`) in
   `nix flake check`; `packages.nixfs-doc` (`craneLib.cargoDoc`) is the
   offline rustdoc HTML.
+- Clippy: `Cargo.toml` sets `[lints.clippy] pedantic = warn`; `checks.clippy`
+  (`craneLib.cargoClippy`, `--all-targets --all-features -- --deny warnings`)
+  turns warnings into errors in `nix flake check`. Keep new code clippy-clean.
+  Public helpers carry `#[must_use]` and fallible ones document an `# Errors`
+  section.
 
 ## Future investigation
 
