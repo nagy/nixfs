@@ -108,6 +108,7 @@ fn lock_cache(cache: &Arc<Mutex<Cache>>) -> MutexGuard<'_, Cache> {
 
 impl NixFS {
     /// Create an empty filesystem resolving attributes from `nixpkgs`.
+    #[must_use]
     pub fn new(nixpkgs: String) -> Self {
         Self {
             cache: Arc::new(Mutex::new(Cache {
@@ -402,6 +403,7 @@ pub struct NixError {
 /// // Unknown failure → generic EIO
 /// assert_eq!(classify_eval_error("error: some random failure"), 5); // EIO
 /// ```
+#[must_use]
 pub fn classify_eval_error(stderr: &str) -> i32 {
     // Match the final `error:` line, not build-log noise: bare words like
     // "network" appear in unrelated messages (e.g. network namespaces).
@@ -454,6 +456,7 @@ pub fn classify_eval_error(stderr: &str) -> i32 {
 /// assert_eq!(err.errno, 2); // ENOENT
 /// assert!(err.message.contains("not found"));
 /// ```
+#[must_use]
 pub fn classify_nix_stderr(stderr: &str) -> Option<NixError> {
     let message = stderr.trim().to_string();
     // If nix eval fails on a set, treat the attribute as a directory:
@@ -911,6 +914,11 @@ pub enum CliAction {
 /// assert!(parse_args(&["--bogus".to_string()]).is_err());
 /// assert!(parse_args(&["/mnt".to_string(), "/extra".to_string()]).is_err());
 /// ```
+///
+/// # Errors
+///
+/// Returns the usage message when an option is unknown or when more than one
+/// mountpoint argument appears. The caller prints the message and exits 2.
 pub fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut mount_path = None;
     let mut nixpkgs = NIXPKGS.to_string();
